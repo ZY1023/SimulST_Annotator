@@ -1,0 +1,2 @@
+# Optional independent local source speech activity detection.
+silero-vad==6.2.3
