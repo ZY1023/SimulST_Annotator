@@ -32,11 +32,20 @@ def test_vad_job_persists_and_diagnostics_use_only_review_flags(media):
         ("speech", 900, 1100), ("nonspeech", 1100, 2000)]
     initialize(main.DB_PATH)
     assert main.vad_status(media_id)["intervals"] == state["intervals"]
+    first_run_id = state["run"]["id"]
+    vad.enqueue(main.DB_PATH, media_id)
+    assert vad.process_next_job(main.DB_PATH, private, FakeVAD())
+    assert main.vad_status(media_id)["run"]["id"] != first_run_id
+    with connect(main.DB_PATH) as db:
+        assert db.execute("SELECT COUNT(*) FROM vad_runs WHERE media_id=?", (media_id,)).fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM vad_intervals WHERE run_id=?", (first_run_id,)).fetchone()[0] == 5
     asr.enqueue(main.DB_PATH, media_id, "small")
     asr.process_next_job(main.DB_PATH, private, FakeEngine())
     before = main.get_source_words(media_id)
     report = main.alignment_diagnostics(media_id)
-    assert report["vad_run_id"] == state["run"]["id"]
+    assert report["vad_run_id"] == main.vad_status(media_id)["run"]["id"]
+    assert all(item["speech_overlap_ms"] + item["nonspeech_overlap_ms"] == item["duration_ms"]
+               for item in report["word_details"])
     assert main.get_source_words(media_id) == before  # diagnostic never edits source words
 
 

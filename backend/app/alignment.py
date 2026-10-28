@@ -59,7 +59,8 @@ def timing_diagnostics(db, media: dict) -> dict:
         for issue in set(issues): counts[issue] += 1
         if issues:
             details.append({"word_id": row["id"], "start_ms": row["start_ms"], "end_ms": row["end_ms"],
-                            "duration_ms": duration, "nonspeech_overlap_ms": nonspeech_overlap,
+                            "duration_ms": duration, "speech_overlap_ms": duration - nonspeech_overlap,
+                            "nonspeech_overlap_ms": nonspeech_overlap,
                             "raw_start_ms": raw_start, "raw_end_ms": raw_end,
                             "waveform_rms_at_start": waveform_rms(row["start_ms"]),
                             "waveform_rms_at_midpoint": waveform_rms((row["start_ms"] + row["end_ms"]) // 2),
