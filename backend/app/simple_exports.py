@@ -70,6 +70,8 @@ def build_files(data: dict, datasets: list[str], format: str, complete: bool = F
                     if row["media_id"] == asset["id"] and (dataset in DATASETS or row["tier_id"] == dataset.removeprefix("tier:"))]
             if dataset == "source_transcripts" and format != "detailed_json":
                 rows = [row for row in rows if row.get("speech_status") != "not_spoken" and row.get("review_status") != "rejected"]
+            if dataset == "subtitle_screen_states" and format != "detailed_json":
+                rows = [row for row in rows if row.get("review_status") == "reviewed" and row.get("text", "").strip()]
             if data["scope"] == "project" and not rows:
                 continue
             rows.sort(key=lambda row: (row.get("start_ms", row.get("frame_ms", row.get("span", {}).get("start_ms", 0))), row["id"]))

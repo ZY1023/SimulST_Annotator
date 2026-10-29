@@ -10,6 +10,9 @@ import type { SourceWord } from './useSourceTranscript'
 import { SourceWordInspector } from './SourceWordInspector'
 import { SourceTranscriptReview } from './SourceTranscriptReview'
 import { useSourceVAD } from './useSourceVAD'
+import { useTargetOCR } from './useTargetOCR'
+import type { SubtitleROI, SubtitleState } from './useTargetOCR'
+import { VideoROI } from './VideoROI'
 import './research.css'
 
 const defaultTiers: Array<[string, string]> = [
@@ -17,6 +20,7 @@ const defaultTiers: Array<[string, string]> = [
   ['subtitle_state', 'Subtitle state'], ['disfluency', 'Disfluency'], ['revision', 'Revision'],
 ]
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
+const defaultSubtitleROI: SubtitleROI = { x: .06, y: .72, width: .88, height: .23 }
 const toMs = (seconds: number) => Math.round(seconds * 1000)
 function timeText(ms: number) {
   const value = Math.max(0, Math.round(ms))
@@ -43,11 +47,31 @@ export default function ResearchApp() {
   const [mediaId, setMediaId] = useState<string | null>(null)
   const source = useSourceTranscript(mediaId)
   const vad = useSourceVAD(mediaId)
+  const targetOCR = useTargetOCR(mediaId)
+  const [splitHeight, setSplitHeight] = useState(() => {
+    const stored = Number(localStorage.getItem('simulst.upperHeight'))
+    return Number.isFinite(stored) && stored >= 240 ? stored : Math.round(window.innerHeight * .35)
+  })
+  const [videoAspect, setVideoAspect] = useState(16 / 9)
+  const splitStart = useRef<{ y: number; height: number } | null>(null)
+  const [ocrSetup, setOCRSetup] = useState(false)
+  const [ocrROI, setOCRROI] = useState<SubtitleROI>(() => {
+    try { return JSON.parse(localStorage.getItem('simulst.targetROI') || '') as SubtitleROI }
+    catch { return defaultSubtitleROI }
+  })
+  const [ocrStart, setOCRStart] = useState(0)
+  const [ocrEnd, setOCREnd] = useState(30000)
+  const [ocrFPS, setOCRFPS] = useState(5)
+  const [selectedStateId, setSelectedStateId] = useState<string | null>(null)
+  const [stateDraft, setStateDraft] = useState<{ start_ms: number; end_ms: number; text: string; review_status: ReviewStatus } | null>(null)
   const [showVAD, setShowVAD] = useState(true)
+  const [showTargetStates, setShowTargetStates] = useState(true)
   const [timingIssues, setTimingIssues] = useState<Record<string, string[]>>({})
   const [selectedWordId, setSelectedWordId] = useState<string | null>(null)
   const [asrModel, setAsrModel] = useState<'small' | 'medium'>('small')
   const [tiers, setTiers] = useState<Tier[]>([])
+  const [hiddenTiers, setHiddenTiers] = useState<Set<string>>(new Set())
+  const [tierManagerOpen, setTierManagerOpen] = useState(false)
   const [annotations, setAnnotations] = useState<HumanAnnotation[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
@@ -66,6 +90,7 @@ export default function ResearchApp() {
   const [drag, setDrag] = useState<{ tierId: string; start: number; end: number } | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const videoBoxRef = useRef<HTMLDivElement>(null)
   const waveformNode = useRef<HTMLDivElement>(null)
   const timelineNode = useRef<HTMLDivElement>(null)
   const playbackEnd = useRef<number | null>(null)
@@ -121,6 +146,18 @@ export default function ResearchApp() {
   const project = projects.find(item => item.id === projectId) ?? null
   const media = assets.find(asset => asset.id === mediaId) ?? null
   const durationMs = media?.duration_ms ?? 30000
+  const effectiveSplitHeight = clamp(splitHeight, 240, Math.max(260, window.innerHeight - 240))
+  useEffect(() => {
+    const resize = () => setSplitHeight(value => clamp(value, 240, Math.max(260, window.innerHeight - 240)))
+    window.addEventListener('resize', resize)
+    return () => window.removeEventListener('resize', resize)
+  }, [])
+  useEffect(() => { localStorage.setItem('simulst.targetROI', JSON.stringify(ocrROI)) }, [ocrROI])
+  useEffect(() => { setOCRStart(0); setOCREnd(Math.min(media?.duration_ms ?? 30000, 30000)); setSelectedStateId(null); setStateDraft(null); setVideoAspect(16 / 9) }, [media?.id])
+  useEffect(() => {
+    try { setHiddenTiers(new Set(JSON.parse(localStorage.getItem(`simulst.hiddenTiers.${mediaId}`) || '[]') as string[])) }
+    catch { setHiddenTiers(new Set()) }
+  }, [mediaId])
   const timelineWidth = Math.max(900, Math.ceil(durationMs / 1000 * zoom))
   const pixelsPerSecond = timelineWidth / Math.max(durationMs / 1000, 0.001)
   const playheadMs = clamp(timeMs - (media?.media_offset_ms ?? 0), 0, durationMs)
@@ -137,10 +174,11 @@ export default function ResearchApp() {
   }
   const selected = annotations.find(item => item.id === selectedId) ?? null
   const selectedWord = source.words.find(item => item.id === selectedWordId) ?? null
+  const selectedState = targetOCR.states.find(item => item.id === selectedStateId) ?? null
   const displayWords = useMemo(() => source.words.map(word => ({ ...word,
     attention: [...new Set([...word.attention, ...(timingIssues[word.id] ?? [])])] })), [source.words, timingIssues])
   const spokenWordIds = source.words.filter(word => word.speech_status !== 'not_spoken' && word.review_status !== 'rejected' && word.start_ms <= playheadMs && playheadMs < word.end_ms).map(word => word.id)
-  const shownTiers = media ? tiers : defaultTiers.map(([kind, name], sort_order) => ({ id: `preview:${kind}`, project_id: '', media_id: '', kind, name, sort_order }))
+  const shownTiers = (media ? tiers : defaultTiers.map(([kind, name], sort_order) => ({ id: `preview:${kind}`, project_id: '', media_id: '', kind, name, sort_order }))).filter(tier => !hiddenTiers.has(tier.id))
 
   useEffect(() => {
     fetch('/api/projects').then(readJson<Project[]>).then(items => {
@@ -254,7 +292,14 @@ export default function ResearchApp() {
     }
     return saveQueue.current
   }
-  const flushDraft = async (): Promise<boolean> => (await flushAnnotationDraft()) && (await source.flush())
+  const flushStateDraft = async (): Promise<boolean> => {
+    if (!selectedState || !stateDraft) return true
+    if (selectedState.text === stateDraft.text && selectedState.start_ms === stateDraft.start_ms &&
+        selectedState.end_ms === stateDraft.end_ms && selectedState.review_status === stateDraft.review_status) return true
+    try { await targetOCR.saveState(selectedState, stateDraft); return true }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); return false }
+  }
+  const flushDraft = async (): Promise<boolean> => (await flushAnnotationDraft()) && (await source.flush()) && (await flushStateDraft())
   const editDraft = (change: Partial<Draft>) => {
     if (!draft || !selected) return
     const next = { ...draft, ...change }
@@ -281,11 +326,12 @@ export default function ResearchApp() {
   }, [draft, selectedId, media?.id])
   useEffect(() => {
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
-      if (dirty.current || source.dirty.current || saveStatus === 'saving' || source.saveStatus === 'saving') { event.preventDefault(); event.returnValue = '' }
+      if (dirty.current || source.dirty.current || saveStatus === 'saving' || source.saveStatus === 'saving' ||
+          (selectedState && stateDraft && (selectedState.text !== stateDraft.text || selectedState.start_ms !== stateDraft.start_ms || selectedState.end_ms !== stateDraft.end_ms || selectedState.review_status !== stateDraft.review_status))) { event.preventDefault(); event.returnValue = '' }
     }
     window.addEventListener('beforeunload', onBeforeUnload)
     return () => window.removeEventListener('beforeunload', onBeforeUnload)
-  }, [saveStatus, source.saveStatus])
+  }, [saveStatus, source.saveStatus, selectedState, stateDraft])
 
   const openProject = async (id: string) => {
     if (!(await flushDraft())) return false
@@ -365,6 +411,7 @@ export default function ResearchApp() {
     dirty.current = false
     undoStack.current = []; redoStack.current = []
     setSelectedWordId(null)
+    setSelectedStateId(null)
     setSelectedId(annotation.id)
     setDraft({ start_ms: annotation.span.start_ms, end_ms: annotation.span.end_ms,
       text: annotation.text, event_label: annotation.event_label ?? '',
@@ -395,6 +442,47 @@ export default function ResearchApp() {
       setTiers(items => [...items, tier])
       setSaveStatus('saved'); setLastSavedAt(new Date().toISOString())
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+  }
+  const toggleTier = (id: string) => {
+    setHiddenTiers(current => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      if (media) localStorage.setItem(`simulst.hiddenTiers.${media.id}`, JSON.stringify([...next]))
+      return next
+    })
+  }
+  const renameTier = async (tier: Tier) => {
+    if (!media) return
+    const name = window.prompt('Rename tier', tier.name)?.trim()
+    if (!name || name === tier.name) return
+    try {
+      const updated = await fetch(`/api/media/${media.id}/tiers/${encodeURIComponent(tier.id)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+      }).then(readJson<Tier>)
+      setTiers(items => items.map(item => item.id === tier.id ? updated : item))
+    } catch (reason) { setError(String(reason)) }
+  }
+  const moveTier = async (tier: Tier, delta: number) => {
+    if (!media) return
+    const order = [...tiers].sort((a, b) => a.sort_order - b.sort_order)
+    const index = order.findIndex(item => item.id === tier.id), nextIndex = index + delta
+    if (nextIndex < 0 || nextIndex >= order.length) return
+    ;[order[index], order[nextIndex]] = [order[nextIndex], order[index]]
+    try {
+      const updated = await fetch(`/api/media/${media.id}/tiers/order`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: order.map(item => item.id) }),
+      }).then(readJson<Tier[]>)
+      setTiers(updated)
+    } catch (reason) { setError(String(reason)) }
+  }
+  const deleteTier = async (tier: Tier) => {
+    if (!media || !window.confirm(`Delete the empty tier “${tier.name}”? Existing annotations cannot be deleted with a tier.`)) return
+    try {
+      const response = await fetch(`/api/media/${media.id}/tiers/${encodeURIComponent(tier.id)}?confirm_name=${encodeURIComponent(tier.name)}`, { method: 'DELETE' })
+      if (!response.ok) { const body = await response.json().catch(() => null); throw new Error(body?.detail || `Delete failed (${response.status})`) }
+      setTiers(items => items.filter(item => item.id !== tier.id))
+    } catch (reason) { setError(String(reason)) }
   }
   const pointerMs = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect()
@@ -487,8 +575,36 @@ export default function ResearchApp() {
   }
 
   const chooseWord = async (word: SourceWord) => {
-    if (!(await flushAnnotationDraft())) return
-    setSelectedId(null); setDraft(null); setSelectedWordId(word.id)
+    if (!(await flushDraft())) return
+    setSelectedId(null); setDraft(null); setSelectedStateId(null); setSelectedWordId(word.id)
+  }
+  const chooseState = async (state: SubtitleState, skipSave = false) => {
+    if (selectedStateId === state.id) { seek(stateDraft?.start_ms ?? state.start_ms); return }
+    if (!(await flushAnnotationDraft()) || !(await source.flush())) return
+    if (!skipSave && !(await flushStateDraft())) return
+    setSelectedId(null); setSelectedWordId(null); setDraft(null)
+    setSelectedStateId(state.id)
+    setStateDraft({ start_ms: state.start_ms, end_ms: state.end_ms, text: state.text, review_status: state.review_status })
+    seek(state.start_ms)
+  }
+  const saveState = async (reviewNext = false) => {
+    if (!selectedState || !stateDraft) return
+    try {
+      await targetOCR.saveState(selectedState, reviewNext ? { ...stateDraft, review_status: 'reviewed' } : stateDraft)
+      if (reviewNext) setStateDraft(current => current ? { ...current, review_status: 'reviewed' } : current)
+      setError('')
+      if (reviewNext) {
+        const ordered = [...targetOCR.states].sort((a, b) => a.start_ms - b.start_ms || a.id.localeCompare(b.id))
+        const next = ordered[ordered.findIndex(item => item.id === selectedState.id) + 1]
+        if (next) void chooseState(next, true)
+      }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+  }
+  const stepState = (direction: -1 | 1) => {
+    if (!selectedState) return
+    const ordered = [...targetOCR.states].sort((a, b) => a.start_ms - b.start_ms || a.id.localeCompare(b.id))
+    const next = ordered[ordered.findIndex(item => item.id === selectedState.id) + direction]
+    if (next) void chooseState(next)
   }
   const editWord = (id: string, change: Partial<SourceWord>) => {
     source.mutate(source.words.map(word => word.id === id ? { ...word, ...change, edit_status: 'edited' } : word))
@@ -655,17 +771,17 @@ export default function ResearchApp() {
       {activeDialog === 'shortcuts' && <ShortcutHelp bindings={shortcutSettings.bindings} onClose={closeDialog} />}
       {activeDialog === 'settings' && <SettingsDialog project={project} shortcuts={shortcutSettings} onApplyShortcuts={setShortcutSettings} onStorage={() => openDialog('storage')} onClose={closeDialog} asrPreferences={source.preferences} onSaveASR={source.updatePreferences} />}
       {error && <div className="app-message error" role="alert">{error}<button onClick={() => setError('')} aria-label="Dismiss error">×</button></div>}
-      <div className="upper-workspace">
+      <div className="upper-workspace" style={window.innerWidth > 800 ? { height: effectiveSplitHeight } : undefined}>
         <section className="video-section" aria-label="Video preview">
-          <div className="video-box">{media ? <video key={media.id} ref={videoRef} src={media.video_url} preload="metadata" onTimeUpdate={sync} onSeeking={sync} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} onError={() => setError('Video cannot be played. Check its codec.')} onClick={togglePlay} /> : <div className="video-placeholder"><span className="placeholder-play">▶</span><strong>Video preview</strong><p>{project ? 'Select or add media above' : 'Create or open a project to begin'}</p></div>}</div>
+          <div className="video-box" ref={videoBoxRef} style={{ width: window.innerWidth > 800 ? Math.min(658, (effectiveSplitHeight - 51) * videoAspect) : undefined, aspectRatio: videoAspect }}>{media ? <video key={media.id} ref={videoRef} src={media.video_url} preload="metadata" onLoadedMetadata={event => { if (event.currentTarget.videoWidth && event.currentTarget.videoHeight) setVideoAspect(event.currentTarget.videoWidth / event.currentTarget.videoHeight) }} onTimeUpdate={sync} onSeeking={sync} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} onError={() => setError('Video cannot be played. Check its codec.')} onClick={togglePlay} /> : <div className="video-placeholder"><span className="placeholder-play">▶</span><strong>Video preview</strong><p>{project ? 'Select or add media above' : 'Create or open a project to begin'}</p></div>}{media && <VideoROI videoRef={videoRef} boxRef={videoBoxRef} active={ocrSetup} roi={ocrROI} onChange={setOCRROI} />}</div>
           <div className="transport"><button title="Previous frame (approx. 40 ms)" onClick={() => stepFrame(-1)} disabled={!media}>|◀</button><button title={playing ? 'Pause' : 'Play'} onClick={togglePlay} disabled={!media}>{playing ? 'Ⅱ' : '▶'}</button><button title="Next frame (approx. 40 ms)" onClick={() => stepFrame(1)} disabled={!media}>▶|</button><span className="time-display">{timeText(timeMs)} <span>/ {media ? timeText(durationMs) : '--:--.---'}</span></span><label className="speed-control">Speed <select value={speed} onChange={event => setSpeed(Number(event.target.value))}><option value={0.5}>0.5×</option><option value={0.75}>0.75×</option><option value={1}>1×</option><option value={1.25}>1.25×</option><option value={1.5}>1.5×</option><option value={2}>2×</option></select></label></div>
         </section>
-        <section className="inspector" aria-label="Annotation editor"><div className="inspector-heading"><div><h2>{selectedWord ? 'Source transcript editor' : 'Annotation editor'}</h2><p>{media ? media.display_name : project ? 'No media selected' : 'No project open'}</p></div>{(selected || selectedWord) && <span className="review-pill">{selectedWord?.review_status ?? draft?.review_status}</span>}</div>
-          {media && source.words.length > 0 && <SourceTranscriptReview words={displayWords} timeMs={playheadMs} selectedId={selectedWordId} durationMs={durationMs}
+        <section className="inspector" aria-label="Annotation editor"><div className="inspector-heading"><div><h2>{selectedState ? 'Target subtitle editor' : selectedWord ? 'Source transcript editor' : 'Annotation editor'}</h2><p>{media ? media.display_name : project ? 'No media selected' : 'No project open'}</p></div>{(selected || selectedWord || selectedState) && <span className="review-pill">{selectedState?.review_status ?? selectedWord?.review_status ?? draft?.review_status}</span>}</div>
+          {media && source.words.length > 0 && !selectedWord && !selected && !selectedState && <SourceTranscriptReview words={displayWords} timeMs={playheadMs} selectedId={selectedWordId} durationMs={durationMs}
             onChoose={word => { void chooseWord(word) }} onEdit={word => { void chooseWord(word).then(() => requestAnimationFrame(() => textAreaRef.current?.focus())) }}
             onPlayRange={playRange} onNext={nextUnreviewedWord} onPreview={(start, end) => source.previewAlignment(start, end, asrModel)}
             onApply={source.applyAlignment} onReject={source.rejectAlignment} />}
-          {selectedWord ? <SourceWordInspector word={displayWords.find(word => word.id === selectedWord.id) ?? selectedWord} durationMs={durationMs} textRef={textAreaRef}
+          {selectedState && stateDraft ? <div className="editor-fields target-state-editor"><label>Complete visible subtitle<textarea value={stateDraft.text} onChange={event => setStateDraft(current => current ? { ...current, text: event.target.value } : current)} placeholder="No visible subtitle" /></label><div className="field-grid"><label>Start (ms)<input type="number" min="0" max={durationMs} value={stateDraft.start_ms} onChange={event => setStateDraft(current => current ? { ...current, start_ms: Number(event.target.value) } : current)} /></label><label>End (ms)<input type="number" min="1" max={durationMs} value={stateDraft.end_ms} onChange={event => setStateDraft(current => current ? { ...current, end_ms: Number(event.target.value) } : current)} /></label></div><label>Review status<select value={stateDraft.review_status} onChange={event => setStateDraft(current => current ? { ...current, review_status: event.target.value as ReviewStatus } : current)}><option value="unreviewed">Unreviewed</option><option value="reviewed">Reviewed</option><option value="rejected">Rejected</option></select></label><p className="editor-footnote">Raw OCR remains separate · confidence {selectedState.provenance.confidence === null ? 'unknown' : `${Math.round(selectedState.provenance.confidence * 100)}%`}{selectedState.provenance.needs_review ? ' · check recognition' : ''}</p><div className="editor-actions"><button className="ui-button primary" onClick={() => void saveState()}>Save state</button><button className="ui-button subtle" onClick={() => stepState(-1)}>Previous</button><button className="ui-button subtle" onClick={() => stepState(1)}>Next</button><button className="ui-button subtle" onClick={() => void saveState(true)}>Review &amp; Next</button></div></div> : selectedWord ? <SourceWordInspector word={displayWords.find(word => word.id === selectedWord.id) ?? selectedWord} durationMs={durationMs} textRef={textAreaRef}
             onEdit={change => editWord(selectedWord.id, change)} onSave={() => void source.saveNow()} onSeek={() => seek(selectedWord.start_ms)}
             onPlay={() => { seek(Math.max(0, selectedWord.start_ms - 200)); void videoRef.current?.play().catch(() => setError('Video playback failed. Check the MP4 codec.')) }}
             onSplit={splitWord} onMerge={mergeNextWord} onDelete={deleteWord}
@@ -673,7 +789,14 @@ export default function ResearchApp() {
             onNext={nextUnreviewedWord} /> : selected && draft ? <div className="editor-fields"><label>Text / transcription<textarea ref={textAreaRef} value={draft.text} onChange={event => editDraft({ text: event.target.value })} placeholder="Word, character, subtitle, or note" /></label><div className="field-grid"><label>Start (ms)<input type="number" min="0" max={durationMs} value={draft.start_ms} onChange={event => editDraft({ start_ms: Number(event.target.value) })} /></label><label>End (ms)<input type="number" min="0" max={durationMs} value={draft.end_ms} onChange={event => editDraft({ end_ms: Number(event.target.value) })} /></label></div><div className="field-grid"><label>Event label<input value={draft.event_label} onChange={event => editDraft({ event_label: event.target.value })} placeholder="Optional" /></label><label>Review status<select value={draft.review_status} onChange={event => editDraft({ review_status: event.target.value as ReviewStatus })}><option value="unreviewed">Unreviewed</option><option value="reviewed">Reviewed</option><option value="rejected">Rejected</option></select></label></div><div className="field-grid"><label>Time precision<select value={draft.precision} onChange={event => editDraft({ precision: event.target.value as TimePrecision })}><option value="estimated">Estimated</option><option value="frame">Frame</option><option value="exact">Exact</option></select></label><label>Tier<input readOnly value={tiers.find(tier => tier.id === selected.tier_id)?.name ?? ''} /></label></div><div className="editor-actions"><button className="ui-button primary" onClick={save}>Save annotation</button><button className="ui-button subtle" onClick={() => restoreDraft('undo')} disabled={!undoStack.current.length}>Undo</button><button className="ui-button subtle" onClick={() => restoreDraft('redo')} disabled={!redoStack.current.length}>Redo</button><button className="ui-button danger" onClick={remove}>Delete</button></div><p className="editor-footnote">Manual annotation · ID {selected.id.slice(0, 8)}</p></div> : <div className="inspector-empty"><span>⌖</span><strong>{media ? 'Select or create an interval' : 'Open a video to annotate'}</strong><p>{media ? 'Drag across a tier below, then edit its text and timestamps here.' : 'Video and annotation details appear in this workspace.'}</p></div>}
         </section>
       </div>
-      <section className="timeline-section" aria-label="Annotation timeline"><div className="timeline-toolbar"><div><h2>Timeline</h2><p>{media ? 'Drag an empty tier to create · select an interval to edit' : 'Import a video to begin annotating'}</p></div><div className="timeline-controls"><button className="ui-button subtle" onClick={addTier} disabled={!media}>＋ Add tier</button><label className="review-follow"><input type="checkbox" checked={timelineFollow} onChange={event => setTimelineFollow(event.target.checked)} /> Follow playback</label><span>Zoom</span><button className="zoom-button" title="Zoom out" onClick={() => changeZoom(Math.round(zoom / 1.4))}>−</button><span className="zoom-value">{Math.round(pixelsPerSecond)} px/s</span><button className="zoom-button" title="Zoom in" onClick={() => changeZoom(Math.round(zoom * 1.4))}>＋</button></div></div>
+      <div className="workspace-splitter" role="separator" aria-label="Resize video and timeline" aria-orientation="horizontal" aria-valuemin={240} aria-valuemax={Math.max(260, window.innerHeight - 240)} aria-valuenow={effectiveSplitHeight} tabIndex={0}
+        onPointerDown={event => { splitStart.current = { y: event.clientY, height: effectiveSplitHeight }; event.currentTarget.setPointerCapture(event.pointerId); event.preventDefault() }}
+        onPointerMove={event => { if (splitStart.current) setSplitHeight(clamp(splitStart.current.height + event.clientY - splitStart.current.y, 240, Math.max(260, window.innerHeight - 240))) }}
+        onPointerUp={event => { if (!splitStart.current) return; const next = clamp(splitStart.current.height + event.clientY - splitStart.current.y, 240, Math.max(260, window.innerHeight - 240)); splitStart.current = null; setSplitHeight(next); localStorage.setItem('simulst.upperHeight', String(next)) }}
+        onPointerCancel={() => { splitStart.current = null }}
+        onKeyDown={event => { if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); const next = clamp(effectiveSplitHeight + (event.key === 'ArrowDown' ? 20 : -20), 240, Math.max(260, window.innerHeight - 240)); setSplitHeight(next); localStorage.setItem('simulst.upperHeight', String(next)) } }} />
+      <section className="timeline-section" aria-label="Annotation timeline"><div className="timeline-toolbar"><div><h2>Timeline</h2><p>{media ? 'Drag an empty tier to create · select an interval to edit' : 'Import a video to begin annotating'}</p></div><div className="timeline-controls"><button className="ui-button subtle" onClick={addTier} disabled={!media}>＋ Add tier</button><button className="ui-button subtle" onClick={() => setTierManagerOpen(value => !value)} disabled={!media} aria-expanded={tierManagerOpen}>Manage tiers</button><label className="review-follow"><input type="checkbox" checked={timelineFollow} onChange={event => setTimelineFollow(event.target.checked)} /> Follow playback</label><span>Zoom</span><button className="zoom-button" title="Zoom out" onClick={() => changeZoom(Math.round(zoom / 1.4))}>−</button><span className="zoom-value">{Math.round(pixelsPerSecond)} px/s</span><button className="zoom-button" title="Zoom in" onClick={() => changeZoom(Math.round(zoom * 1.4))}>＋</button></div></div>
+        {tierManagerOpen && media && <div className="tier-manager" aria-label="Tier management"><div><strong>Target Subtitle States</strong><button onClick={() => setShowTargetStates(value => !value)}>{showTargetStates ? 'Hide' : 'Show'}</button><button disabled title="OCR states are protected">Delete</button></div><div><strong>Source VAD</strong><button onClick={() => setShowVAD(value => !value)}>{showVAD ? 'Hide' : 'Show'}</button><button disabled title="Source VAD data is protected">Delete</button></div>{[...tiers].sort((a, b) => a.sort_order - b.sort_order).map(tier => <div key={tier.id}><strong>{tier.name}</strong><button onClick={() => toggleTier(tier.id)}>{hiddenTiers.has(tier.id) ? 'Show' : 'Hide'}</button><button onClick={() => void renameTier(tier)}>Rename</button><button onClick={() => void moveTier(tier, -1)} disabled={tier.sort_order === 0} aria-label={`Move ${tier.name} up`}>↑</button><button onClick={() => void moveTier(tier, 1)} disabled={tier.sort_order === tiers.length - 1} aria-label={`Move ${tier.name} down`}>↓</button><button onClick={() => void deleteTier(tier)} disabled={tier.kind !== 'custom'} title={tier.kind !== 'custom' ? 'Built-in tiers are protected' : 'Delete empty custom tier'}>Delete</button></div>)}</div>}
         {media && <div className="source-transcription-strip"><strong>Source words</strong><span className={`asr-state ${source.job?.status ?? 'idle'}`}>{source.job ? `${source.job.status}${source.job.cancel_requested && source.job.status === 'running' ? ' · cancelling' : ''}${source.job.device ? ` · ${source.job.device.toUpperCase()}` : ''}` : source.words.length ? `${source.words.length} editable words` : 'No source transcript'}</span>
           <label>Model <select value={asrModel} onChange={event => setAsrModel(event.target.value as 'small' | 'medium')} disabled={source.job?.status === 'queued' || source.job?.status === 'running'}><option value="small">small</option><option value="medium">medium</option></select></label>
           {source.job?.status === 'queued' || source.job?.status === 'running' ? <button onClick={() => void source.cancelJob()} disabled={!!source.job.cancel_requested}>Cancel job</button> : <button onClick={() => void source.startJob(asrModel, !!source.job || source.words.length > 0)}>{source.job?.status === 'failed' || source.job?.status === 'cancelled' ? 'Retry transcription' : source.words.length ? 'Re-transcribe' : 'Transcribe Source Speech'}</button>}
@@ -685,7 +808,10 @@ export default function ResearchApp() {
           {source.candidates.length > 0 && <details className="asr-attention-list"><summary>{source.candidates.length} ASR word(s) need timing review</summary><div>{source.candidates.map(candidate => <p key={candidate.id}><strong>{candidate.text || '(empty)'}</strong> · {candidate.issues.join(', ').replaceAll('_', ' ')} {candidate.raw_start_seconds === null || candidate.raw_end_seconds === null ? <button onClick={() => insertWord(playheadMs, Math.min(playheadMs + 300, durationMs), candidate.text.trim() || '[word]')}>Insert with manual timing</button> : null}</p>)}</div></details>}
         </div>}
         {media && <div className="source-vad-strip"><strong>Source VAD</strong><span>{vad.job ? vad.job.status : vad.run ? 'ready' : 'not generated'}{vad.run ? ` · ${vad.intervals.filter(item => item.kind === 'speech').length} speech intervals` : ''}</span><label><input type="checkbox" checked={showVAD} onChange={event => setShowVAD(event.target.checked)} /> Show tier</label>{vad.job?.status === 'queued' || vad.job?.status === 'running' ? <button onClick={() => void vad.cancel()} disabled={!!vad.job.cancel_requested}>Cancel VAD</button> : <button onClick={() => void vad.start()}>{vad.run ? 'Re-run VAD' : 'Detect source speech'}</button>}{vad.error && <small role="alert">{vad.error}</small>}{vad.job?.status === 'failed' && <small role="alert">{vad.job.error}</small>}</div>}
+        {media && <div className="target-ocr-strip"><strong>Target OCR</strong><span>{targetOCR.job?.status ?? (targetOCR.run ? 'ready' : 'not generated')}{targetOCR.run ? ` · ${targetOCR.states.length} states` : ''}</span><button onClick={() => setOCRSetup(value => !value)} aria-expanded={ocrSetup}>{ocrSetup ? 'Close ROI' : 'Set ROI / range'}</button><label><input type="checkbox" checked={showTargetStates} onChange={event => setShowTargetStates(event.target.checked)} /> Show tier</label>{(targetOCR.job?.status === 'queued' || targetOCR.job?.status === 'running') ? <button onClick={() => void targetOCR.cancel()}>Cancel OCR</button> : <button onClick={() => void targetOCR.start({ start_ms: ocrStart, end_ms: ocrEnd, fps: ocrFPS, roi: ocrROI })} disabled={ocrEnd <= ocrStart}>Run selected range</button>}{targetOCR.error && <small role="alert">{targetOCR.error}</small>}{targetOCR.job?.status === 'failed' && <small role="alert">{targetOCR.job.error}</small>}</div>}
+        {media && ocrSetup && <div className="ocr-setup"><span>Drag or resize the box on the original video frame.</span><label>Start ms <input type="number" min="0" max={durationMs} value={ocrStart} onChange={event => setOCRStart(Number(event.target.value))} /></label><label>End ms <input type="number" min="1" max={durationMs} value={ocrEnd} onChange={event => setOCREnd(Number(event.target.value))} /></label><label>fps <input type="number" min="1" max="15" value={ocrFPS} onChange={event => setOCRFPS(Number(event.target.value))} /></label><button onClick={() => setOCRROI(defaultSubtitleROI)}>Reset ROI</button><small>ROI {ocrROI.x.toFixed(2)}, {ocrROI.y.toFixed(2)}, {ocrROI.width.toFixed(2)}, {ocrROI.height.toFixed(2)} · frame-relative</small></div>}
         <div className="timeline-scroll" ref={timelineNode} tabIndex={0} role="region" aria-label="Scrollable timeline tiers" onWheel={() => setTimelineFollow(false)} onTouchMove={() => setTimelineFollow(false)}><div className="timeline-content" style={{ width: timelineWidth + 148 }}><div className="timeline-ruler"><div className="tier-label">Time</div><div className="ruler-track" style={{ width: timelineWidth }}>{ticks.map(ms => <div className="ruler-tick" key={ms} style={{ left: ms / 1000 * pixelsPerSecond }}><span>{timeText(ms).slice(0, 5)}</span></div>)}</div></div><div className="wave-row"><div className="tier-label">Audio waveform</div><div className="wave-track" style={{ width: timelineWidth }}>{media ? <div ref={waveformNode} className="wave-container" style={{ width: timelineWidth }} /> : <div className="wave-empty">Waveform appears after import</div>}{media && !waveReady && <div className="wave-loading">Loading waveform…</div>}</div></div>
+          {media && showTargetStates && <div className="tier-row"><div className="tier-label"><span className="tier-dot target-ocr" />Target Subtitle States</div><div className="tier-track target-ocr-track" style={{ width: timelineWidth }}>{targetOCR.states.map(state => <button key={state.id} data-ocr-state-id={state.id} className={`interval target-ocr ${selectedStateId === state.id ? 'selected' : ''} ${state.review_status === 'reviewed' ? 'reviewed' : ''}`} style={position(state.start_ms, state.end_ms, pixelsPerSecond)} onClick={() => void chooseState(state)} title={`${state.text || '(no subtitle)'} · ${timeText(state.start_ms)}–${timeText(state.end_ms)} · ${state.review_status}`}>{state.text || '∅'}</button>)}{!targetOCR.run && <span className="source-empty">Run Target OCR on a selected range</span>}</div></div>}
           {media && showVAD && <div className="tier-row source-vad-row"><div className="tier-label"><span className="tier-dot source-vad" />Source VAD</div><div className="tier-track source-vad-track" style={{ width: timelineWidth }}>{vad.intervals.filter(item => item.kind === 'speech').map(item => <div key={item.id} className="vad-interval" style={position(item.start_ms, item.end_ms, pixelsPerSecond)} title={`Estimated speech · ${timeText(item.start_ms)}–${timeText(item.end_ms)} · Silero VAD ${vad.run?.model_version ?? ''}`} />)}{!vad.run && <span className="source-empty">Run Source VAD to see estimated speech activity</span>}</div></div>}          {shownTiers.map(tier => <div className="tier-row" key={tier.id}><div className="tier-label"><span className={`tier-dot ${tier.kind}`} />{tier.name}</div><div className={`tier-track ${tier.kind}`} style={{ width: timelineWidth }} onPointerDown={event => startDrag(event, tier.id)} onPointerMove={event => { if (drag?.tierId === tier.id) setDrag({ ...drag, end: pointerMs(event) }) }} onPointerUp={endDrag} onPointerCancel={() => setDrag(null)}>
             {tier.kind === 'source_words' && source.words.length === 0 && <span className="source-empty">{source.job?.status === 'running' || source.job?.status === 'queued' ? 'Transcribing source speech…' : 'No source words yet · use Transcribe Source Speech or drag to insert a word'}</span>}
             {tier.kind === 'source_words' && displayWords.map(word => {

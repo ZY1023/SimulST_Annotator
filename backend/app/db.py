@@ -118,15 +118,28 @@ CREATE TABLE IF NOT EXISTS app_preferences (
 CREATE TABLE IF NOT EXISTS ocr_observations (
   id TEXT PRIMARY KEY, media_id TEXT NOT NULL REFERENCES media_assets(id),
   frame_ms INTEGER NOT NULL, raw_text TEXT NOT NULL,
-  roi_json TEXT NOT NULL, provenance_json TEXT NOT NULL,
+  roi_json TEXT NOT NULL, provenance_json TEXT NOT NULL, run_id TEXT,
   CHECK(frame_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS ocr_jobs (
+  id TEXT PRIMARY KEY, media_id TEXT NOT NULL REFERENCES media_assets(id),
+  status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','cancelled')),
+  parameters_json TEXT NOT NULL, requested_at TEXT NOT NULL,
+  started_at TEXT, finished_at TEXT, error TEXT,
+  cancel_requested INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ocr_runs (
+  id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE REFERENCES ocr_jobs(id),
+  media_id TEXT NOT NULL REFERENCES media_assets(id),
+  engine TEXT NOT NULL, engine_version TEXT NOT NULL,
+  parameters_json TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS subtitle_screen_states (
   id TEXT PRIMARY KEY, media_id TEXT NOT NULL REFERENCES media_assets(id),
   start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
   precision TEXT NOT NULL, text TEXT NOT NULL,
   observation_ids_json TEXT NOT NULL, provenance_json TEXT NOT NULL,
-  review_status TEXT NOT NULL DEFAULT 'unreviewed',
+  review_status TEXT NOT NULL DEFAULT 'unreviewed', run_id TEXT,
   CHECK(start_ms >= 0 AND end_ms >= start_ms)
 );
 CREATE TABLE IF NOT EXISTS derived_events (
@@ -185,6 +198,8 @@ def initialize(db_path: Path) -> None:
                 "removed_at": "TEXT",
             },
             "annotation_tiers": {"project_id": "TEXT REFERENCES projects(id)"},
+            "ocr_observations": {"run_id": "TEXT"},
+            "subtitle_screen_states": {"run_id": "TEXT"},
             "human_annotations": {
                 "project_id": "TEXT REFERENCES projects(id)",
                 "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -255,6 +270,8 @@ def initialize(db_path: Path) -> None:
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_asr_one_active_job ON asr_jobs(media_id) WHERE status IN ('queued','running')")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vad_one_active_job ON vad_jobs(media_id) WHERE status IN ('queued','running')")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_vad_intervals_media ON vad_intervals(media_id,kind,start_ms)")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ocr_one_active_job ON ocr_jobs(media_id) WHERE status IN ('queued','running')")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_ocr_states_media ON subtitle_screen_states(media_id,run_id,start_ms)")
         connection.execute("INSERT OR IGNORE INTO app_preferences (key, value_json) VALUES ('asr', '{\"auto_transcribe\":true,\"default_model\":\"small\"}')")
         connection.execute("UPDATE projects SET storage_rel_path = 'projects/' || id WHERE storage_rel_path = ''")
         connection.execute("UPDATE media_assets SET display_name = filename WHERE display_name = ''")

@@ -10,6 +10,8 @@ frontend/               React + TypeScript + Vite
   src/WorkspaceDialogs.tsx  project/media managers, storage, export and settings dialogs
   src/shortcuts.ts       validated browser-local shortcut presets and bindings
   src/useSourceTranscript.ts  editable source-word state and autosave
+  src/useTargetOCR.ts      OCR jobs and editable subtitle-state client
+  src/VideoROI.tsx         frame-relative subtitle crop selection
   src/SourceWordInspector.tsx  word review and correction controls
   src/App.tsx            preserved first-milestone UI (not used by the entry point)
   src/contracts.ts       shared wire-format types
@@ -21,7 +23,8 @@ backend/                FastAPI
   app/media.py           FFprobe and FFmpeg integration
   app/storage.py         read-only file reference inventory
   app/exports.py         selected-tier and research-data export
-  app/analysis_contracts.py  future OCR and text-change interfaces (no active processor)
+  app/analysis_contracts.py  OCR and text-change data interfaces
+  app/ocr.py             local PaddleOCR worker and subtitle-state assembly
   app/asr.py             stable-ts engine interface and SQLite-backed worker
   tests/                backend tests
 ../<repository-name>_data/ private SQLite database and media copies (outside Git)
@@ -38,7 +41,7 @@ The default private directory is a sibling named `<repository-name>_data`. The d
 
 The video element is the playback clock. Its current position is converted to integer milliseconds, with `media_offset_ms` added for the canonical timeline. WaveSurfer displays the extracted mono WAV and follows the video; clicking the waveform seeks the video.
 
-SQLite tables include `projects`, `media_assets`, `annotation_tiers`, `human_annotations`, `source_transcripts`, `asr_jobs`, `asr_runs`, `asr_word_candidates`, `source_transcript_meta`, `app_preferences`, `ocr_observations`, `subtitle_screen_states`, and `derived_events`. Source words are edited only in `source_transcripts`; raw model output and every candidate remain in separate ASR tables. Projects store stable IDs, names, JSON settings and relative storage paths. Media rows retain private original and audio paths. Human annotations remain separate from source words. OCR and inferred subtitle states remain schema/contracts only.
+SQLite tables include `projects`, `media_assets`, `annotation_tiers`, `human_annotations`, `source_transcripts`, `asr_jobs`, `asr_runs`, `asr_word_candidates`, `source_transcript_meta`, `app_preferences`, `ocr_jobs`, `ocr_runs`, `ocr_observations`, `subtitle_screen_states`, and `derived_events`. Source words are edited only in `source_transcripts`; raw model output and every candidate remain in separate ASR tables. Projects store stable IDs, names, JSON settings and relative storage paths. Media rows retain private original and audio paths. Human annotations remain separate from source words. OCR observations are immutable; corrected subtitle states live in their own table.
 
 ## Requirements
 
@@ -76,6 +79,8 @@ Creating or deleting an interval, adding a tier, importing media, and renaming a
 
 Source words have their own compact save and ASR job status beside the timeline. See [local ASR setup](docs/ASR.md) and [Source VAD and timing review](docs/SOURCE_VAD.md). Install `backend/requirements-asr.txt` for stable-ts and `backend/requirements-vad.txt` for independent local Silero VAD.
 
+For Target OCR, install `backend/requirements-ocr.txt`, open an MP4, choose **Set ROI / range**, and draw the crop over subtitles on the video. The default range is the first 30 seconds at 5 fps. **Run selected range** samples only that range. Select a state in the Target Subtitle States tier to correct complete screen text and millisecond boundaries, then use **Review & Next**. See [Target OCR workflow](docs/TARGET_OCR.md).
+
 The Export dialog now offers scope, available datasets with counts, Simple JSON, CSV, or Detailed JSON, and an exact file preview. One selected dataset from one video downloads directly; multiple selected datasets or project media are packaged in a ZIP organized by media. An explicit advanced option produces a complete project JSON archive. Source words export as a bare array of `start`, `end`, and `text`. The old comprehensive API remains available for compatibility. JSON is UTF-8; CSV is UTF-8 with a BOM. Exports do not include original videos or private source paths. See [source word timing, review, and export](docs/WORD_ALIGNMENT_REVIEW.md) and [legacy export format](docs/EXPORT_FORMAT.md).
 
 The Project Manager or Settings menu opens a read-only Storage Overview with database and folder paths, counts by media/tier, research-data counts, total project file size and a file-reference audit. Audit labels distinguish active databases, backups, referenced media, standalone demo material and potentially orphaned files. No audit action removes files.
@@ -102,8 +107,13 @@ Keyboard shortcuts: Space plays/pauses; Left/Right nudges the selected token 10 
 | GET | `/api/media/{id}/video` | Stream original MP4 |
 | GET | `/api/media/{id}/audio` | Stream derived WAV |
 | GET/POST | `/api/media/{id}/tiers` | List/create manual annotation tiers |
+| PUT/DELETE | `/api/media/{id}/tiers/{tier_id}` | Rename / delete an empty custom tier |
+| PUT | `/api/media/{id}/tiers/order` | Reorder manual tiers |
 | GET/POST | `/api/media/{id}/annotations` | List/create manual intervals |
 | PUT/DELETE | `/api/media/{id}/annotations/{annotation_id}` | Edit/delete a manual interval |
+| GET/POST | `/api/media/{id}/target-ocr`, `/target-ocr/jobs` | Read OCR state / start a bounded local job |
+| POST | `/api/media/{id}/target-ocr/jobs/{job_id}/cancel` | Cancel an OCR job |
+| PUT | `/api/media/{id}/target-ocr/states/{state_id}` | Save corrected text, times, and review status |
 
 The earlier `/api/media` list/import routes remain for compatibility; the interface uses project-scoped routes.
 
@@ -124,7 +134,7 @@ The backend tests cover millisecond conversion, interval validation, private-sto
 
 ## Milestone boundary
 
-The timeline currently displays manually entered intervals; source words, target characters, subtitle states, disfluency, and revision are tier names, **not automatic predictions**. OCR, ASR/alignment, and subtitle state inference are not implemented. Frame stepping is an approximate 40 ms seek, not codec-accurate frame decoding. For long recordings, waveform decoding may use substantial browser memory.
+The Target Subtitle States tier is generated by OCR. The older manual “Subtitle state” tier remains a distinct annotation tier. Text-change event classification and semantic revision analysis are not implemented. Frame stepping is an approximate 40 ms seek, not codec-accurate frame decoding. For long recordings, waveform decoding may use substantial browser memory.
 
 ## Public repository check
 

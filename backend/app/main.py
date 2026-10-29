@@ -28,6 +28,7 @@ from .asr import ASRWorker, MODELS, cancel as cancel_asr_job, detect_device, enq
 from .alignment import StableTsWordAligner, timing_diagnostics
 from .simple_exports import DATASETS as SIMPLE_DATASETS, build_files
 from .vad import VADWorker, enqueue as enqueue_vad, cancel as cancel_vad_job
+from .ocr import OCRWorker, enqueue as enqueue_ocr, cancel as cancel_ocr_job, validate_roi
 
 DATA_DIR = resolve_data_dir()
 DB_PATH = DATA_DIR / "simulst.sqlite3"
@@ -52,6 +53,26 @@ class Tier(BaseModel):
 
 class TierCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
+
+
+class TierOrder(BaseModel):
+    ids: list[str]
+
+
+class OCRJobCreate(BaseModel):
+    start_ms: int = Field(default=0, ge=0)
+    end_ms: int | None = Field(default=None, gt=0)
+    fps: int = Field(default=5, ge=1, le=15)
+    roi: dict[str, float]
+    crop_change_threshold: float = Field(default=1.2, ge=0, le=30)
+    confidence_review_threshold: float = Field(default=0.75, ge=0, le=1)
+
+
+class SubtitleStateWrite(BaseModel):
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    text: str = Field(max_length=10000)
+    review_status: ReviewStatus
 
 
 class AnnotationWrite(BaseModel):
@@ -203,13 +224,16 @@ async def lifespan(_app: FastAPI):
     initialize(DB_PATH)
     worker = ASRWorker(DB_PATH, DATA_DIR)
     vad_worker = VADWorker(DB_PATH, DATA_DIR)
+    ocr_worker = OCRWorker(DB_PATH, DATA_DIR)
     worker.start()
     vad_worker.start()
+    ocr_worker.start()
     try:
         yield
     finally:
         worker.stop()
         vad_worker.stop()
+        ocr_worker.stop()
 
 
 app = FastAPI(title="SimulST Annotator API", version="0.1.0", lifespan=lifespan)
@@ -789,6 +813,60 @@ def stop_vad_job(media_id: str, job_id: str):
     return dict(cancel_vad_job(DB_PATH, job_id))
 
 
+@app.get("/api/media/{media_id}/target-ocr")
+def target_ocr_status(media_id: str):
+    find_media(media_id)
+    with closing(connect(DB_PATH)) as db:
+        job = db.execute("SELECT * FROM ocr_jobs WHERE media_id=? ORDER BY requested_at DESC,id DESC LIMIT 1", (media_id,)).fetchone()
+        run = db.execute("SELECT * FROM ocr_runs WHERE media_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (media_id,)).fetchone()
+        if run:
+            states = db.execute("SELECT * FROM subtitle_screen_states WHERE media_id=? AND run_id=? ORDER BY start_ms,id",
+                                (media_id, run["id"])).fetchall()
+        else:
+            states = db.execute("SELECT * FROM subtitle_screen_states WHERE media_id=? AND run_id IS NULL ORDER BY start_ms,id",
+                                (media_id,)).fetchall()
+    return {"job": {**dict(job), "parameters": json.loads(job["parameters_json"])} if job else None,
+            "run": {**dict(run), "parameters": json.loads(run["parameters_json"])} if run else None,
+            "states": [{**dict(row), "observation_ids": json.loads(row["observation_ids_json"]),
+                        "provenance": json.loads(row["provenance_json"])} for row in states]}
+
+
+@app.post("/api/media/{media_id}/target-ocr/jobs", status_code=201)
+def start_target_ocr(media_id: str, payload: OCRJobCreate):
+    media = find_media(media_id)
+    params = payload.model_dump()
+    params["end_ms"] = payload.end_ms if payload.end_ms is not None else min(media["duration_ms"], payload.start_ms + 30000)
+    try:
+        validate_roi(params["roi"])
+        return dict(enqueue_ocr(DB_PATH, media_id, params))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/media/{media_id}/target-ocr/jobs/{job_id}/cancel")
+def stop_target_ocr(media_id: str, job_id: str):
+    find_media(media_id)
+    with closing(connect(DB_PATH)) as db:
+        owned = db.execute("SELECT 1 FROM ocr_jobs WHERE id=? AND media_id=?", (job_id, media_id)).fetchone()
+    if not owned: raise HTTPException(status_code=404, detail="OCR job not found")
+    return dict(cancel_ocr_job(DB_PATH, job_id))
+
+
+@app.put("/api/media/{media_id}/target-ocr/states/{state_id}")
+def update_subtitle_state(media_id: str, state_id: str, payload: SubtitleStateWrite):
+    media = find_media(media_id)
+    if payload.end_ms <= payload.start_ms or payload.end_ms > media["duration_ms"]:
+        raise HTTPException(status_code=422, detail="State interval must fit the media")
+    with closing(connect(DB_PATH)) as db, db:
+        state = db.execute("SELECT * FROM subtitle_screen_states WHERE id=? AND media_id=?", (state_id, media_id)).fetchone()
+        if not state: raise HTTPException(status_code=404, detail="Subtitle state not found")
+        db.execute("UPDATE subtitle_screen_states SET start_ms=?,end_ms=?,text=?,review_status=? WHERE id=? AND media_id=?",
+                   (payload.start_ms, payload.end_ms, payload.text, payload.review_status.value, state_id, media_id))
+        updated = db.execute("SELECT * FROM subtitle_screen_states WHERE id=?", (state_id,)).fetchone()
+    return {**dict(updated), "observation_ids": json.loads(updated["observation_ids_json"]),
+            "provenance": json.loads(updated["provenance_json"])}
+
+
 @app.get("/api/media/{media_id}/tiers", response_model=list[Tier])
 def list_tiers(media_id: str):
     ensure_default_tiers(media_id)
@@ -819,6 +897,41 @@ def create_tier(media_id: str, payload: TierCreate):
         )
         connection.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now_utc(), media["project_id"]))
     return Tier(id=tier_id, project_id=media["project_id"], media_id=media_id, name=name, kind="custom", sort_order=order)
+
+
+@app.put("/api/media/{media_id}/tiers/order", response_model=list[Tier])
+def reorder_tiers(media_id: str, payload: TierOrder):
+    existing = list_tiers(media_id)
+    if len(payload.ids) != len(existing) or set(payload.ids) != {tier.id for tier in existing}:
+        raise HTTPException(status_code=422, detail="Provide every tier ID exactly once")
+    with closing(connect(DB_PATH)) as db, db:
+        db.executemany("UPDATE annotation_tiers SET sort_order=? WHERE media_id=? AND id=?",
+                       [(index, media_id, tier_id) for index, tier_id in enumerate(payload.ids)])
+    return list_tiers(media_id)
+
+
+@app.put("/api/media/{media_id}/tiers/{tier_id}", response_model=Tier)
+def rename_tier(media_id: str, tier_id: str, payload: TierCreate):
+    name = payload.name.strip()
+    if not name: raise HTTPException(status_code=422, detail="Tier name cannot be blank")
+    with closing(connect(DB_PATH)) as db, db:
+        row = db.execute("SELECT * FROM annotation_tiers WHERE id=? AND media_id=?", (tier_id, media_id)).fetchone()
+        if not row: raise HTTPException(status_code=404, detail="Tier not found")
+        db.execute("UPDATE annotation_tiers SET name=? WHERE id=?", (name, tier_id))
+        changed = db.execute("SELECT * FROM annotation_tiers WHERE id=?", (tier_id,)).fetchone()
+    return tier_contract(changed)
+
+
+@app.delete("/api/media/{media_id}/tiers/{tier_id}", status_code=204)
+def delete_tier(media_id: str, tier_id: str, confirm_name: str):
+    with closing(connect(DB_PATH)) as db, db:
+        row = db.execute("SELECT * FROM annotation_tiers WHERE id=? AND media_id=?", (tier_id, media_id)).fetchone()
+        if not row: raise HTTPException(status_code=404, detail="Tier not found")
+        if ":" in tier_id: raise HTTPException(status_code=409, detail="Built-in tiers cannot be deleted")
+        if confirm_name != row["name"]: raise HTTPException(status_code=422, detail="Confirm the exact tier name")
+        if db.execute("SELECT 1 FROM human_annotations WHERE tier_id=? LIMIT 1", (tier_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="Tier contains annotations; move or delete them first")
+        db.execute("DELETE FROM annotation_tiers WHERE id=? AND media_id=?", (tier_id, media_id))
 
 
 @app.get("/api/media/{media_id}/annotations", response_model=list[HumanAnnotation])
@@ -1015,6 +1128,12 @@ def export_options(project_id: str, media_id: str | None = None):
 
 def prepared_simple_export(project_id: str, payload: SimpleExportRequest):
     data = redact_private_values(export_data(project_id, payload.media_id))
+    if not payload.complete_project and payload.format != "detailed_json" and "subtitle_screen_states" in payload.datasets:
+        with closing(connect(DB_PATH)) as db:
+            latest = {row["media_id"]: row["id"] for row in db.execute(
+                "SELECT id,media_id FROM ocr_runs ORDER BY created_at,id")}
+        data["subtitle_screen_states"] = [row for row in data["subtitle_screen_states"]
+            if row.get("run_id") == latest.get(row["media_id"])]
     available = set(SIMPLE_DATASETS) | {f"tier:{tier['id']}" for tier in data["annotation_tiers"]}
     if not payload.complete_project and (not payload.datasets or len(set(payload.datasets)) != len(payload.datasets) or not set(payload.datasets) <= available):
         raise HTTPException(422, "Select one or more available datasets")
@@ -1025,7 +1144,8 @@ def prepared_simple_export(project_id: str, payload: SimpleExportRequest):
         with closing(connect(DB_PATH)) as db:
             for table, key in (("asr_jobs", "media_id"), ("asr_runs", "media_id"),
                                ("source_transcript_meta", "media_id"), ("alignment_previews", "media_id"),
-                               ("vad_jobs", "media_id"), ("vad_runs", "media_id"), ("all_vad_intervals", "media_id")):
+                               ("vad_jobs", "media_id"), ("vad_runs", "media_id"), ("all_vad_intervals", "media_id"),
+                               ("ocr_jobs", "media_id"), ("ocr_runs", "media_id")):
                 actual_table = "vad_intervals" if table == "all_vad_intervals" else table
                 rows = db.execute(f"SELECT * FROM {actual_table} WHERE {key} IN ({','.join('?' for _ in media_ids)})", media_ids).fetchall() if media_ids else []
                 data[table] = [{key[:-5] if key.endswith("_json") else key:

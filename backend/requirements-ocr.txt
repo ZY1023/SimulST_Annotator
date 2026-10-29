@@ -1,0 +1,4 @@
+# Optional local target-subtitle OCR. Install with the core backend requirements.
+paddlepaddle==3.1.0
+paddleocr==3.6.0
+opencv-python>=4.10,<5

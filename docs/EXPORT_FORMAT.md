@@ -64,3 +64,5 @@ Only selected formats and datasets are included. Media IDs in paths prevent coll
 The older `GET /api/projects/{id}/export` route remains for compatibility and uses its earlier schema. New dialog exports use schema version 2.
 
 The separate **Source Words → Simple JSON** option exports only the current editable word transcript as `start`, `end`, and `text`. It does not change either comprehensive export format. See [ASR and simple JSON](ASR.md).
+
+The separate **Target subtitle states → Simple JSON** option exports only reviewed, nonempty corrected states from the latest OCR run for one media item. The file is a bare array of `{ "start": seconds, "end": seconds, "text": string }` objects; it contains no unrelated tiers or project metadata. Detailed JSON and complete exports continue to retain OCR provenance and raw observations. See [Target OCR workflow](TARGET_OCR.md).
