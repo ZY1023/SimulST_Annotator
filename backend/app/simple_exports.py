@@ -6,11 +6,14 @@ import re
 import zipfile
 from dataclasses import dataclass
 
-DATASETS = ("source_transcripts", "subtitle_screen_states", "derived_events", "ocr_observations", "vad_intervals")
+DATASETS = ("source_transcripts", "subtitle_screen_states", "derived_events", "ocr_observations", "vad_intervals",
+            "target_update_events", "output_gap_candidates")
 LABELS = {"source_transcripts": "Source words", "subtitle_screen_states": "Target subtitle states",
-          "derived_events": "Text change events", "ocr_observations": "OCR observations", "vad_intervals": "Source VAD intervals"}
+          "derived_events": "Text change events", "ocr_observations": "OCR observations", "vad_intervals": "Source VAD intervals",
+          "target_update_events": "Target update events", "output_gap_candidates": "Output gap candidates"}
 FILENAMES = {"source_transcripts": "source_words", "subtitle_screen_states": "target_subtitle_states",
-             "derived_events": "text_change_events", "ocr_observations": "ocr_observations", "vad_intervals": "source_vad_intervals"}
+             "derived_events": "text_change_events", "ocr_observations": "ocr_observations", "vad_intervals": "source_vad_intervals",
+             "target_update_events": "target_update_events", "output_gap_candidates": "output_gap_candidates"}
 
 
 @dataclass
@@ -40,6 +43,13 @@ def simple_rows(dataset: str, rows: list[dict]) -> list[dict]:
     if dataset == "vad_intervals":
         return [{"start": round(row["start_ms"] / 1000, 3), "end": round(row["end_ms"] / 1000, 3),
                  "activity": row["kind"]} for row in rows]
+    if dataset == "target_update_events":
+        return [{"time": round(row["start_ms"] / 1000, 3), "type": row["event_type"],
+                 "before": row["before_text"], "after": row["after_text"]} for row in rows]
+    if dataset == "output_gap_candidates":
+        return [{"start": round(row["start_ms"] / 1000, 3), "end": round(row["end_ms"] / 1000, 3),
+                 "duration": round(row["duration_ms"] / 1000, 3), "blank_screen": row["blank_screen"],
+                 "source_speech_overlap": round(row["source_speech_overlap_ms"] / 1000, 3)} for row in rows]
     return [{"start": round(row["span"]["start_ms"] / 1000, 3),
              "end": round(row["span"]["end_ms"] / 1000, 3), "text": row["text"],
              "label": row["event_label"], "review_status": row["review_status"]} for row in rows]
@@ -55,7 +65,8 @@ def csv_bytes(rows: list[dict], columns: list[str]) -> bytes:
     return stream.getvalue().encode("utf-8-sig")
 
 
-def build_files(data: dict, datasets: list[str], format: str, complete: bool = False) -> tuple[str, str, bytes, list[dict]]:
+def build_files(data: dict, datasets: list[str], format: str, complete: bool = False,
+                include_unreviewed: bool = False, include_rejected: bool = False) -> tuple[str, str, bytes, list[dict]]:
     if complete:
         content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         name = "complete_project.json" if data["scope"] == "project" else "complete_media.json"
@@ -71,7 +82,8 @@ def build_files(data: dict, datasets: list[str], format: str, complete: bool = F
             if dataset == "source_transcripts" and format != "detailed_json":
                 rows = [row for row in rows if row.get("speech_status") != "not_spoken" and row.get("review_status") != "rejected"]
             if dataset == "subtitle_screen_states" and format != "detailed_json":
-                rows = [row for row in rows if row.get("review_status") == "reviewed" and row.get("text", "").strip()]
+                allowed = {"reviewed"} | ({"unreviewed"} if include_unreviewed else set()) | ({"rejected"} if include_rejected else set())
+                rows = [row for row in rows if row.get("review_status") in allowed and row.get("text", "").strip()]
             if data["scope"] == "project" and not rows:
                 continue
             rows.sort(key=lambda row: (row.get("start_ms", row.get("frame_ms", row.get("span", {}).get("start_ms", 0))), row["id"]))
@@ -82,7 +94,10 @@ def build_files(data: dict, datasets: list[str], format: str, complete: bool = F
             else:
                 columns = list(values[0]) if values else (list(simple_rows(dataset, rows)[0]) if rows else
                     (["start", "end", "text"] if dataset in ("source_transcripts", "subtitle_screen_states") else
-                     ["time", "text"] if dataset == "ocr_observations" else ["start", "end", "activity"] if dataset == "vad_intervals" else ["start", "end", "type", "before", "after"] if dataset == "derived_events" else
+                     ["time", "text"] if dataset == "ocr_observations" else ["start", "end", "activity"] if dataset == "vad_intervals" else
+                     ["time", "type", "before", "after"] if dataset == "target_update_events" else
+                     ["start", "end", "duration", "blank_screen", "source_speech_overlap"] if dataset == "output_gap_candidates" else
+                     ["start", "end", "type", "before", "after"] if dataset == "derived_events" else
                      ["start", "end", "text", "label", "review_status"]))
                 content = csv_bytes(values, columns)
             files.append(ExportFile(filename, dataset, len(rows), content))

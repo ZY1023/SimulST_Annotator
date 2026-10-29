@@ -163,16 +163,22 @@ type ExportPreview = { filename: string; media_type: string; bytes: number; reco
 const dataLabels: Record<string, string> = {
   source_transcripts: 'Source words', subtitle_screen_states: 'Target subtitle states',
   derived_events: 'Text change events', ocr_observations: 'OCR observations',
-  vad_intervals: 'Source VAD intervals',
+  vad_intervals: 'Source VAD intervals', target_update_events: 'Target update events',
+  output_gap_candidates: 'Output gap candidates',
 }
-export function ExportDialog({ project, media, onClose, beforeExport }: {
+export function ExportDialog({ project, media, onClose, beforeExport, ocrRuns, selectedOCRRunId }: {
   project: Project; media: MediaAsset | null; onClose: () => void; beforeExport: () => Promise<boolean>
+  ocrRuns?: Array<{ id: string; created_at: string }>; selectedOCRRunId?: string | null
 }) {
   const [scope, setScope] = useState<'media' | 'project'>(media ? 'media' : 'project')
   const [options, setOptions] = useState<ExportOptions | null>(null)
   const [selected, setSelected] = useState<string[]>([])
   const [format, setFormat] = useState<'simple_json' | 'csv' | 'detailed_json'>('simple_json')
   const [complete, setComplete] = useState(false)
+  const [includeUnreviewed, setIncludeUnreviewed] = useState(false)
+  const [includeRejected, setIncludeRejected] = useState(false)
+  const [ocrRunId, setOCRRunId] = useState(selectedOCRRunId ?? '')
+  const [gapThreshold, setGapThreshold] = useState(2000)
   const [preview, setPreview] = useState<ExportPreview | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -189,7 +195,9 @@ export function ExportDialog({ project, media, onClose, beforeExport }: {
     }).catch(reason => { if (active) setError(String(reason)) })
     return () => { active = false }
   }, [project.id, media?.id, scope])
-  const payload = { media_id: scope === 'media' ? media?.id : null, datasets: selected, format, complete_project: complete }
+  const payload = { media_id: scope === 'media' ? media?.id : null, datasets: selected, format, complete_project: complete,
+    include_unreviewed: includeUnreviewed, include_rejected: includeRejected,
+    ocr_run_id: scope === 'media' ? ocrRunId || null : null, gap_threshold_ms: gapThreshold }
   useEffect(() => {
     if ((!selected.length && !complete) || (complete && scope !== 'project')) { setPreview(null); return }
     let active = true
@@ -199,7 +207,7 @@ export function ExportDialog({ project, media, onClose, beforeExport }: {
         .catch(reason => { if (active) { setPreview(null); setError(reason instanceof Error ? reason.message : String(reason)) } })
     }, 150)
     return () => { active = false; window.clearTimeout(timer) }
-  }, [project.id, scope, media?.id, selected.join('|'), format, complete])
+  }, [project.id, scope, media?.id, selected.join('|'), format, complete, includeUnreviewed, includeRejected, ocrRunId, gapThreshold])
   const download = async () => {
     if (busyRef.current) return
     busyRef.current = true; setBusy(true); setError('')
@@ -219,11 +227,11 @@ export function ExportDialog({ project, media, onClose, beforeExport }: {
   const choices = [
     ...(options?.research_data ?? []).map(item => ({ key: item.name, label: dataLabels[item.name] ?? item.name, count: item.record_count })),
     ...(options?.tiers ?? []).map(tier => ({ key: `tier:${tier.id}`, label: `${tier.name} annotations`, count: tier.record_count })),
-  ].filter(item => item.count > 0)
+  ].filter(item => item.count > 0 || ['subtitle_screen_states', 'target_update_events', 'output_gap_candidates'].includes(item.key))
   return <Modal title="Export Annotations" onClose={onClose} busy={busy}>
     {error && <p className="dialog-error" role="alert">{error}</p>}
     <section className="dataset-group"><h3>1. Export Scope</h3><div className="export-grid"><label>Scope<select value={scope} onChange={event => { setScope(event.target.value as typeof scope); setComplete(false) }}><option value="project">Entire project</option>{media && <option value="media">Current video</option>}</select></label></div></section>
-    <section className="dataset-group"><h3>2. Select Data</h3><div className="tier-choices">{choices.length ? choices.map(item => <label key={item.key} className="checkbox-line"><input type="checkbox" disabled={complete} checked={selected.includes(item.key)} onChange={event => setSelected(current => event.target.checked ? [...current, item.key] : current.filter(key => key !== item.key))} />{item.label} <small>({item.count} stored records)</small></label>) : <p>No exportable records in this scope.</p>}</div>{selected.includes('subtitle_screen_states') && format !== 'detailed_json' && <p className="pending-dataset">Target subtitle export includes reviewed, nonempty states from the latest OCR run only.</p>}<p className="pending-dataset">Derived metrics are planned and have no exportable records yet.</p></section>
+    <section className="dataset-group"><h3>2. Select Data</h3><div className="tier-choices">{choices.length ? choices.map(item => <label key={item.key} className="checkbox-line"><input type="checkbox" disabled={complete} checked={selected.includes(item.key)} onChange={event => setSelected(current => event.target.checked ? [...current, item.key] : current.filter(key => key !== item.key))} />{item.label} <small>({item.count} available records)</small></label>) : <p>No exportable records in this scope.</p>}</div>{selected.some(key => ['subtitle_screen_states', 'target_update_events', 'output_gap_candidates'].includes(key)) && <div className="export-grid">{scope === 'media' && !!ocrRuns?.length && <label>OCR run<select value={ocrRunId} onChange={event => setOCRRunId(event.target.value)}><option value="">Latest completed</option>{ocrRuns.map(run => <option key={run.id} value={run.id}>{run.created_at} · {run.id.slice(0, 8)}</option>)}</select></label>}{format !== 'detailed_json' && <><label className="checkbox-line"><input type="checkbox" checked={includeUnreviewed} onChange={event => setIncludeUnreviewed(event.target.checked)} />Include unreviewed states</label><label className="checkbox-line"><input type="checkbox" checked={includeRejected} onChange={event => setIncludeRejected(event.target.checked)} />Include rejected states</label></>}{selected.includes('output_gap_candidates') && <label>Output gap threshold (ms)<input type="number" min="1" step="100" value={gapThreshold} onChange={event => setGapThreshold(Math.max(1, Number(event.target.value) || 1))} /></label>}</div>}{selected.includes('subtitle_screen_states') && format !== 'detailed_json' && <p className="pending-dataset">Simple export uses active subtitle states from the selected OCR run. Reviewed states are included by default.</p>}</section>
     <section className="dataset-group"><h3>3. Output Format</h3><div className="export-grid"><label>Format<select value={format} disabled={complete} onChange={event => setFormat(event.target.value as typeof format)}><option value="simple_json">Simple JSON</option><option value="csv">CSV</option><option value="detailed_json">Detailed JSON</option></select></label></div></section>
     {scope === 'project' && <details className="export-technical"><summary>Advanced: complete project archive</summary><label className="checkbox-line"><input type="checkbox" checked={complete} onChange={event => setComplete(event.target.checked)} />Complete project JSON with metadata and relationships</label></details>}
     <section className="dataset-group" aria-live="polite"><h3>Preview</h3>{preview ? <><p>{preview.record_count} records · {preview.media_type === 'application/zip' ? 'ZIP' : preview.media_type === 'text/csv' ? 'CSV' : 'JSON'} · {preview.filename}</p><div className="export-preview-files">{preview.files.map(item => <div key={item.filename}>{item.filename} · {item.count} records</div>)}</div></> : <p>Select data to preview exact output files.</p>}</section>

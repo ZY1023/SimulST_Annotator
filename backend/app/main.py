@@ -28,7 +28,9 @@ from .asr import ASRWorker, MODELS, cancel as cancel_asr_job, detect_device, enq
 from .alignment import StableTsWordAligner, timing_diagnostics
 from .simple_exports import DATASETS as SIMPLE_DATASETS, build_files
 from .vad import VADWorker, enqueue as enqueue_vad, cancel as cancel_vad_job
-from .ocr import OCRWorker, enqueue as enqueue_ocr, cancel as cancel_ocr_job, validate_roi
+from .ocr import OCRWorker, enqueue as enqueue_ocr, cancel as cancel_ocr_job, resume as resume_ocr_job, validate_roi
+from . import subtitle_states
+from . import timing_metrics
 
 DATA_DIR = resolve_data_dir()
 DB_PATH = DATA_DIR / "simulst.sqlite3"
@@ -60,8 +62,11 @@ class TierOrder(BaseModel):
 
 
 class OCRJobCreate(BaseModel):
+    mode: Literal["range", "entire"] = "range"
     start_ms: int = Field(default=0, ge=0)
     end_ms: int | None = Field(default=None, gt=0)
+    chunk_ms: int = Field(default=30000, ge=1000, le=60000)
+    overlap_ms: int = Field(default=200, ge=0, le=1000)
     fps: int = Field(default=5, ge=1, le=15)
     roi: dict[str, float]
     crop_change_threshold: float = Field(default=1.2, ge=0, le=30)
@@ -73,6 +78,26 @@ class SubtitleStateWrite(BaseModel):
     end_ms: int = Field(gt=0)
     text: str = Field(max_length=10000)
     review_status: ReviewStatus
+
+
+class SubtitleStateInsert(BaseModel):
+    run_id: str
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    text: str = Field(default="", max_length=10000)
+
+
+class SubtitleSelection(BaseModel):
+    state_ids: list[str] = Field(min_length=2)
+
+
+class SubtitleMerge(SubtitleSelection):
+    confirm_different: bool = False
+    text: str | None = None
+
+
+class SubtitleSplit(BaseModel):
+    split_ms: int = Field(gt=0)
 
 
 class AnnotationWrite(BaseModel):
@@ -122,6 +147,10 @@ class SimpleExportRequest(BaseModel):
     datasets: list[str] = Field(default_factory=list)
     format: Literal["simple_json", "csv", "detailed_json"] = "simple_json"
     complete_project: bool = False
+    ocr_run_id: str | None = None
+    include_unreviewed: bool = False
+    include_rejected: bool = False
+    gap_threshold_ms: int = Field(default=2000, ge=1, le=600000)
 
 
 class ASRSettingsWrite(BaseModel):
@@ -814,19 +843,38 @@ def stop_vad_job(media_id: str, job_id: str):
 
 
 @app.get("/api/media/{media_id}/target-ocr")
-def target_ocr_status(media_id: str):
+def target_ocr_status(media_id: str, run_id: str | None = None):
     find_media(media_id)
     with closing(connect(DB_PATH)) as db:
         job = db.execute("SELECT * FROM ocr_jobs WHERE media_id=? ORDER BY requested_at DESC,id DESC LIMIT 1", (media_id,)).fetchone()
-        run = db.execute("SELECT * FROM ocr_runs WHERE media_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (media_id,)).fetchone()
+        runs = db.execute("""SELECT r.*,j.status AS job_status FROM ocr_runs r JOIN ocr_jobs j ON j.id=r.job_id
+            WHERE r.media_id=? ORDER BY r.created_at DESC,r.id DESC""", (media_id,)).fetchall()
+        if run_id and not any(row["id"] == run_id for row in runs):
+            raise HTTPException(status_code=404, detail="OCR run not found for this media")
+        run = next((row for row in runs if row["id"] == run_id), None) if run_id else \
+            next((row for row in runs if row["job_status"] == "completed"), None)
+        if run_id and run:
+            job = db.execute("SELECT * FROM ocr_jobs WHERE id=?", (run["job_id"],)).fetchone()
         if run:
-            states = db.execute("SELECT * FROM subtitle_screen_states WHERE media_id=? AND run_id=? ORDER BY start_ms,id",
+            states = db.execute("SELECT * FROM subtitle_screen_states WHERE media_id=? AND run_id=? AND active=1 ORDER BY start_ms,id",
                                 (media_id, run["id"])).fetchall()
         else:
-            states = db.execute("SELECT * FROM subtitle_screen_states WHERE media_id=? AND run_id IS NULL ORDER BY start_ms,id",
+            states = db.execute("SELECT * FROM subtitle_screen_states WHERE media_id=? AND run_id IS NULL AND active=1 ORDER BY start_ms,id",
                                 (media_id,)).fetchall()
+        chunks = db.execute("SELECT * FROM ocr_job_chunks WHERE job_id=? ORDER BY chunk_index", (job["id"],)).fetchall() if job else []
+        summary = None
+        if run:
+            observations = db.execute("SELECT raw_text,provenance_json FROM ocr_observations WHERE run_id=?", (run["id"],)).fetchall()
+            summary = {"frames_sampled": len(observations),
+                       "ocr_calls": sum(json.loads(row["provenance_json"]).get("method") != "crop_reuse" for row in observations),
+                       "raw_text_variants": len({row["raw_text"] for row in observations}),
+                       "proposed_states": len(states),
+                       "uncertain_transitions": sum(bool(json.loads(row["provenance_json"]).get("uncertain_transition")) for row in states),
+                       "duplicate_observations_consolidated": db.execute("SELECT COALESCE(SUM(duplicates_consolidated),0) FROM ocr_job_chunks WHERE job_id=?", (run["job_id"],)).fetchone()[0]}
     return {"job": {**dict(job), "parameters": json.loads(job["parameters_json"])} if job else None,
             "run": {**dict(run), "parameters": json.loads(run["parameters_json"])} if run else None,
+            "runs": [{**dict(row), "parameters": json.loads(row["parameters_json"])} for row in runs],
+            "chunks": [dict(row) for row in chunks], "summary": summary,
             "states": [{**dict(row), "observation_ids": json.loads(row["observation_ids_json"]),
                         "provenance": json.loads(row["provenance_json"])} for row in states]}
 
@@ -835,7 +883,10 @@ def target_ocr_status(media_id: str):
 def start_target_ocr(media_id: str, payload: OCRJobCreate):
     media = find_media(media_id)
     params = payload.model_dump()
-    params["end_ms"] = payload.end_ms if payload.end_ms is not None else min(media["duration_ms"], payload.start_ms + 30000)
+    if payload.mode == "entire":
+        params["start_ms"], params["end_ms"] = 0, media["duration_ms"]
+    else:
+        params["end_ms"] = payload.end_ms if payload.end_ms is not None else min(media["duration_ms"], payload.start_ms + 30000)
     try:
         validate_roi(params["roi"])
         return dict(enqueue_ocr(DB_PATH, media_id, params))
@@ -852,19 +903,95 @@ def stop_target_ocr(media_id: str, job_id: str):
     return dict(cancel_ocr_job(DB_PATH, job_id))
 
 
+@app.post("/api/media/{media_id}/target-ocr/jobs/{job_id}/resume")
+def resume_target_ocr(media_id: str, job_id: str):
+    find_media(media_id)
+    with closing(connect(DB_PATH)) as db:
+        owned = db.execute("SELECT 1 FROM ocr_jobs WHERE id=? AND media_id=?", (job_id, media_id)).fetchone()
+    if not owned: raise HTTPException(status_code=404, detail="OCR job not found")
+    return dict(resume_ocr_job(DB_PATH, job_id))
+
+
 @app.put("/api/media/{media_id}/target-ocr/states/{state_id}")
 def update_subtitle_state(media_id: str, state_id: str, payload: SubtitleStateWrite):
     media = find_media(media_id)
     if payload.end_ms <= payload.start_ms or payload.end_ms > media["duration_ms"]:
         raise HTTPException(status_code=422, detail="State interval must fit the media")
     with closing(connect(DB_PATH)) as db, db:
-        state = db.execute("SELECT * FROM subtitle_screen_states WHERE id=? AND media_id=?", (state_id, media_id)).fetchone()
+        state = db.execute("SELECT * FROM subtitle_screen_states WHERE id=? AND media_id=? AND active=1", (state_id, media_id)).fetchone()
         if not state: raise HTTPException(status_code=404, detail="Subtitle state not found")
         db.execute("UPDATE subtitle_screen_states SET start_ms=?,end_ms=?,text=?,review_status=? WHERE id=? AND media_id=?",
                    (payload.start_ms, payload.end_ms, payload.text, payload.review_status.value, state_id, media_id))
         updated = db.execute("SELECT * FROM subtitle_screen_states WHERE id=?", (state_id,)).fetchone()
     return {**dict(updated), "observation_ids": json.loads(updated["observation_ids_json"]),
             "provenance": json.loads(updated["provenance_json"])}
+
+
+@app.post("/api/media/{media_id}/target-ocr/states/insert", status_code=201)
+def insert_subtitle_state(media_id: str, payload: SubtitleStateInsert):
+    media = find_media(media_id)
+    if payload.end_ms > media["duration_ms"]: raise HTTPException(422, "State interval must fit the media")
+    try: return subtitle_states.insert_state(DB_PATH, media_id, payload.run_id, payload.start_ms, payload.end_ms, payload.text)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/media/{media_id}/target-ocr/states/merge/preview")
+def preview_subtitle_merge(media_id: str, payload: SubtitleSelection):
+    find_media(media_id)
+    try: return subtitle_states.merge_preview(DB_PATH, media_id, payload.state_ids)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/media/{media_id}/target-ocr/states/merge")
+def merge_subtitle_states(media_id: str, payload: SubtitleMerge):
+    find_media(media_id)
+    try: return subtitle_states.merge_states(DB_PATH, media_id, payload.state_ids, payload.confirm_different, payload.text)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/media/{media_id}/target-ocr/states/{state_id}/split")
+def split_subtitle_state(media_id: str, state_id: str, payload: SubtitleSplit):
+    find_media(media_id)
+    try: return subtitle_states.split_state(DB_PATH, media_id, state_id, payload.split_ms)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/media/{media_id}/target-ocr/operations/{operation_id}/undo")
+def undo_subtitle_operation(media_id: str, operation_id: str):
+    find_media(media_id)
+    try: return subtitle_states.toggle_operation(DB_PATH, media_id, operation_id)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/media/{media_id}/target-ocr/operations/{operation_id}/redo")
+def redo_subtitle_operation(media_id: str, operation_id: str):
+    find_media(media_id)
+    try: return subtitle_states.toggle_operation(DB_PATH, media_id, operation_id, True)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/media/{media_id}/target-ocr/states/group")
+def group_subtitle_states(media_id: str, payload: SubtitleSelection):
+    find_media(media_id)
+    try: return subtitle_states.group_states(DB_PATH, media_id, payload.state_ids)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/media/{media_id}/target-ocr/metrics")
+def target_timing_metrics(media_id: str, run_id: str | None = None, include_unreviewed: bool = False,
+                          gap_threshold_ms: int = 2000, include_rejected: bool = False):
+    document = target_ocr_status(media_id, run_id)
+    states = [row for row in document["states"] if row["review_status"] == "reviewed" or
+              (include_unreviewed and row["review_status"] == "unreviewed") or
+              (include_rejected and row["review_status"] == "rejected")]
+    with closing(connect(DB_PATH)) as db:
+        vad_run = db.execute("SELECT id FROM vad_runs WHERE media_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (media_id,)).fetchone()
+        speech = [dict(row) for row in db.execute("SELECT * FROM vad_intervals WHERE media_id=? AND run_id=? AND kind='speech'",
+                   (media_id, vad_run["id"]))] if vad_run else []
+    try: return timing_metrics.derive(states, speech, gap_threshold_ms,
+                                      document["run"]["id"] if document["run"] else None,
+                                      vad_run["id"] if vad_run else None)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/media/{media_id}/tiers", response_model=list[Tier])
@@ -1121,19 +1248,39 @@ def export_options(project_id: str, media_id: str | None = None):
     counts: dict[str, int] = {}
     for record in data["annotations"]:
         counts[record["tier_id"]] = counts.get(record["tier_id"], 0) + 1
+    metric_counts = {"target_update_events": 0, "output_gap_candidates": 0}
+    for asset in data["media_assets"]:
+        derived = target_timing_metrics(asset["id"])
+        for key in metric_counts: metric_counts[key] += len(derived[key])
     return {"scope": data["scope"], "media_assets": data["media_assets"],
             "tiers": [{**tier, "record_count": counts.get(tier["id"], 0)} for tier in data["annotation_tiers"]],
-            "research_data": [{"name": key, "record_count": len(data[key])} for key in RESEARCH_TYPES]}
+            "research_data": [{"name": key, "record_count": len(data[key])} for key in RESEARCH_TYPES] +
+                             [{"name": key, "record_count": value} for key, value in metric_counts.items()]}
 
 
 def prepared_simple_export(project_id: str, payload: SimpleExportRequest):
     data = redact_private_values(export_data(project_id, payload.media_id))
+    if payload.ocr_run_id and payload.media_id is None:
+        raise HTTPException(422, "Select one media item before choosing an OCR run")
+    for key in ("target_update_events", "output_gap_candidates"):
+        data[key] = []
+    if not payload.complete_project and any(key in payload.datasets for key in ("target_update_events", "output_gap_candidates")):
+        for asset in data["media_assets"]:
+            derived = target_timing_metrics(asset["id"], payload.ocr_run_id if asset["id"] == payload.media_id else None,
+                                            payload.include_unreviewed, payload.gap_threshold_ms, payload.include_rejected)
+            for key in ("target_update_events", "output_gap_candidates"):
+                data[key].extend(derived[key])
     if not payload.complete_project and payload.format != "detailed_json" and "subtitle_screen_states" in payload.datasets:
         with closing(connect(DB_PATH)) as db:
-            latest = {row["media_id"]: row["id"] for row in db.execute(
-                "SELECT id,media_id FROM ocr_runs ORDER BY created_at,id")}
+            latest = {row["media_id"]: row["id"] for row in db.execute("""SELECT r.id,r.media_id FROM ocr_runs r
+                JOIN ocr_jobs j ON j.id=r.job_id WHERE j.status='completed' ORDER BY r.created_at,r.id""")}
+            if payload.ocr_run_id:
+                chosen = db.execute("SELECT media_id FROM ocr_runs WHERE id=?", (payload.ocr_run_id,)).fetchone()
+                if not chosen or payload.media_id != chosen["media_id"]:
+                    raise HTTPException(422, "Selected OCR run must belong to the current media")
+                latest[payload.media_id] = payload.ocr_run_id
         data["subtitle_screen_states"] = [row for row in data["subtitle_screen_states"]
-            if row.get("run_id") == latest.get(row["media_id"])]
+            if row.get("run_id") == latest.get(row["media_id"]) and row.get("active", 1)]
     available = set(SIMPLE_DATASETS) | {f"tier:{tier['id']}" for tier in data["annotation_tiers"]}
     if not payload.complete_project and (not payload.datasets or len(set(payload.datasets)) != len(payload.datasets) or not set(payload.datasets) <= available):
         raise HTTPException(422, "Select one or more available datasets")
@@ -1145,7 +1292,8 @@ def prepared_simple_export(project_id: str, payload: SimpleExportRequest):
             for table, key in (("asr_jobs", "media_id"), ("asr_runs", "media_id"),
                                ("source_transcript_meta", "media_id"), ("alignment_previews", "media_id"),
                                ("vad_jobs", "media_id"), ("vad_runs", "media_id"), ("all_vad_intervals", "media_id"),
-                               ("ocr_jobs", "media_id"), ("ocr_runs", "media_id")):
+                               ("ocr_jobs", "media_id"), ("ocr_runs", "media_id"),
+                               ("subtitle_state_operations", "media_id")):
                 actual_table = "vad_intervals" if table == "all_vad_intervals" else table
                 rows = db.execute(f"SELECT * FROM {actual_table} WHERE {key} IN ({','.join('?' for _ in media_ids)})", media_ids).fetchall() if media_ids else []
                 data[table] = [{key[:-5] if key.endswith("_json") else key:
@@ -1156,8 +1304,12 @@ def prepared_simple_export(project_id: str, payload: SimpleExportRequest):
             data["asr_word_candidates"] = [{key[:-5] if key.endswith("_json") else key:
                                              json.loads(row[key]) if key.endswith("_json") else row[key]
                                              for key in row.keys()} for row in rows]
+            ocr_job_ids = [item["id"] for item in data["ocr_jobs"]]
+            rows = db.execute(f"SELECT * FROM ocr_job_chunks WHERE job_id IN ({','.join('?' for _ in ocr_job_ids)})", ocr_job_ids).fetchall() if ocr_job_ids else []
+            data["ocr_job_chunks"] = [dict(row) for row in rows]
         data = redact_private_values(data)
-    return build_files(data, payload.datasets, payload.format, payload.complete_project)
+    return build_files(data, payload.datasets, payload.format, payload.complete_project,
+                       payload.include_unreviewed, payload.include_rejected)
 
 
 @app.post("/api/projects/{project_id}/export/simple/preview")
