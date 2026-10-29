@@ -44,8 +44,12 @@ def simple_rows(dataset: str, rows: list[dict]) -> list[dict]:
         return [{"start": round(row["start_ms"] / 1000, 3), "end": round(row["end_ms"] / 1000, 3),
                  "activity": row["kind"]} for row in rows]
     if dataset == "target_update_events":
-        return [{"time": round(row["start_ms"] / 1000, 3), "type": row["event_type"],
-                 "before": row["before_text"], "after": row["after_text"]} for row in rows]
+        return [{"time": round(row["start_ms"] / 1000, 3),
+                 "type": row["human_event_type"] or row["visual_event_type"],
+                 "detected_type": row["visual_event_type"], "before": row["before_text"],
+                 "after": row["after_text"], "added": row["change_counts"]["added"],
+                 "deleted": row["change_counts"]["deleted"], "replaced": row["change_counts"]["replaced"],
+                 "review_status": row["review_status"], "notes": row["notes"]} for row in rows]
     if dataset == "output_gap_candidates":
         return [{"start": round(row["start_ms"] / 1000, 3), "end": round(row["end_ms"] / 1000, 3),
                  "duration": round(row["duration_ms"] / 1000, 3), "blank_screen": row["blank_screen"],
@@ -84,6 +88,9 @@ def build_files(data: dict, datasets: list[str], format: str, complete: bool = F
             if dataset == "subtitle_screen_states" and format != "detailed_json":
                 allowed = {"reviewed"} | ({"unreviewed"} if include_unreviewed else set()) | ({"rejected"} if include_rejected else set())
                 rows = [row for row in rows if row.get("review_status") in allowed and row.get("text", "").strip()]
+            if dataset == "target_update_events" and format != "detailed_json":
+                allowed = {"confirmed"} | ({"unreviewed", "uncertain"} if include_unreviewed else set()) | ({"rejected"} if include_rejected else set())
+                rows = [row for row in rows if row["review_status"] in allowed and not row["invalidated"]]
             if data["scope"] == "project" and not rows:
                 continue
             rows.sort(key=lambda row: (row.get("start_ms", row.get("frame_ms", row.get("span", {}).get("start_ms", 0))), row["id"]))
@@ -95,7 +102,7 @@ def build_files(data: dict, datasets: list[str], format: str, complete: bool = F
                 columns = list(values[0]) if values else (list(simple_rows(dataset, rows)[0]) if rows else
                     (["start", "end", "text"] if dataset in ("source_transcripts", "subtitle_screen_states") else
                      ["time", "text"] if dataset == "ocr_observations" else ["start", "end", "activity"] if dataset == "vad_intervals" else
-                     ["time", "type", "before", "after"] if dataset == "target_update_events" else
+                     ["time", "type", "detected_type", "before", "after", "added", "deleted", "replaced", "review_status", "notes"] if dataset == "target_update_events" else
                      ["start", "end", "duration", "blank_screen", "source_speech_overlap"] if dataset == "output_gap_candidates" else
                      ["start", "end", "type", "before", "after"] if dataset == "derived_events" else
                      ["start", "end", "text", "label", "review_status"]))

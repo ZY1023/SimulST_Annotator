@@ -30,7 +30,7 @@ from .simple_exports import DATASETS as SIMPLE_DATASETS, build_files
 from .vad import VADWorker, enqueue as enqueue_vad, cancel as cancel_vad_job
 from .ocr import OCRWorker, enqueue as enqueue_ocr, cancel as cancel_ocr_job, resume as resume_ocr_job, validate_roi
 from . import subtitle_states
-from . import timing_metrics
+from . import timing_metrics, target_events
 
 DATA_DIR = resolve_data_dir()
 DB_PATH = DATA_DIR / "simulst.sqlite3"
@@ -98,6 +98,15 @@ class SubtitleMerge(SubtitleSelection):
 
 class SubtitleSplit(BaseModel):
     split_ms: int = Field(gt=0)
+
+
+class TargetEventReviewWrite(BaseModel):
+    run_id: str | None = None
+    source_fingerprint: str
+    human_event_type: Literal["appearance", "addition", "deletion", "replacement", "disappearance",
+                              "mixed", "layout_only", "uncertain"] | None = None
+    review_status: Literal["unreviewed", "confirmed", "rejected", "uncertain"]
+    notes: str = Field(default="", max_length=4000)
 
 
 class AnnotationWrite(BaseModel):
@@ -923,6 +932,8 @@ def update_subtitle_state(media_id: str, state_id: str, payload: SubtitleStateWr
         db.execute("UPDATE subtitle_screen_states SET start_ms=?,end_ms=?,text=?,review_status=? WHERE id=? AND media_id=?",
                    (payload.start_ms, payload.end_ms, payload.text, payload.review_status.value, state_id, media_id))
         updated = db.execute("SELECT * FROM subtitle_screen_states WHERE id=?", (state_id,)).fetchone()
+    if (state["start_ms"], state["end_ms"], state["text"]) != (payload.start_ms, payload.end_ms, payload.text):
+        target_events.invalidate_for_states(DB_PATH, media_id, [state_id])
     return {**dict(updated), "observation_ids": json.loads(updated["observation_ids_json"]),
             "provenance": json.loads(updated["provenance_json"])}
 
@@ -945,14 +956,20 @@ def preview_subtitle_merge(media_id: str, payload: SubtitleSelection):
 @app.post("/api/media/{media_id}/target-ocr/states/merge")
 def merge_subtitle_states(media_id: str, payload: SubtitleMerge):
     find_media(media_id)
-    try: return subtitle_states.merge_states(DB_PATH, media_id, payload.state_ids, payload.confirm_different, payload.text)
+    try:
+        result = subtitle_states.merge_states(DB_PATH, media_id, payload.state_ids, payload.confirm_different, payload.text)
+        target_events.invalidate_for_states(DB_PATH, media_id, payload.state_ids)
+        return result
     except ValueError as exc: raise HTTPException(422, str(exc)) from exc
 
 
 @app.post("/api/media/{media_id}/target-ocr/states/{state_id}/split")
 def split_subtitle_state(media_id: str, state_id: str, payload: SubtitleSplit):
     find_media(media_id)
-    try: return subtitle_states.split_state(DB_PATH, media_id, state_id, payload.split_ms)
+    try:
+        result = subtitle_states.split_state(DB_PATH, media_id, state_id, payload.split_ms)
+        target_events.invalidate_for_states(DB_PATH, media_id, [state_id])
+        return result
     except ValueError as exc: raise HTTPException(422, str(exc)) from exc
 
 
@@ -968,6 +985,22 @@ def redo_subtitle_operation(media_id: str, operation_id: str):
     find_media(media_id)
     try: return subtitle_states.toggle_operation(DB_PATH, media_id, operation_id, True)
     except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/media/{media_id}/target-ocr/events")
+def list_target_events(media_id: str, run_id: str | None = None):
+    document = target_ocr_status(media_id, run_id)
+    chosen = document["run"]["id"] if document["run"] else None
+    return {"run_id": chosen, "events": target_events.list_events(DB_PATH, media_id, chosen)}
+
+
+@app.put("/api/media/{media_id}/target-ocr/events/{event_id}")
+def save_target_event_review(media_id: str, event_id: str, payload: TargetEventReviewWrite):
+    document = target_ocr_status(media_id, payload.run_id)
+    chosen = document["run"]["id"] if document["run"] else None
+    try: return target_events.save_review(DB_PATH, media_id, chosen, event_id, payload.source_fingerprint,
+                                          payload.human_event_type, payload.review_status, payload.notes)
+    except ValueError as exc: raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/media/{media_id}/target-ocr/states/group")
@@ -1251,7 +1284,9 @@ def export_options(project_id: str, media_id: str | None = None):
     metric_counts = {"target_update_events": 0, "output_gap_candidates": 0}
     for asset in data["media_assets"]:
         derived = target_timing_metrics(asset["id"])
-        for key in metric_counts: metric_counts[key] += len(derived[key])
+        metric_counts["output_gap_candidates"] += len(derived["output_gap_candidates"])
+        metric_counts["target_update_events"] += sum(item["review_status"] == "confirmed" and not item["invalidated"]
+            for item in list_target_events(asset["id"])["events"])
     return {"scope": data["scope"], "media_assets": data["media_assets"],
             "tiers": [{**tier, "record_count": counts.get(tier["id"], 0)} for tier in data["annotation_tiers"]],
             "research_data": [{"name": key, "record_count": len(data[key])} for key in RESEARCH_TYPES] +
@@ -1268,8 +1303,10 @@ def prepared_simple_export(project_id: str, payload: SimpleExportRequest):
         for asset in data["media_assets"]:
             derived = target_timing_metrics(asset["id"], payload.ocr_run_id if asset["id"] == payload.media_id else None,
                                             payload.include_unreviewed, payload.gap_threshold_ms, payload.include_rejected)
-            for key in ("target_update_events", "output_gap_candidates"):
-                data[key].extend(derived[key])
+            data["output_gap_candidates"].extend(derived["output_gap_candidates"])
+            if "target_update_events" in payload.datasets:
+                data["target_update_events"].extend(list_target_events(asset["id"],
+                    payload.ocr_run_id if asset["id"] == payload.media_id else None)["events"])
     if not payload.complete_project and payload.format != "detailed_json" and "subtitle_screen_states" in payload.datasets:
         with closing(connect(DB_PATH)) as db:
             latest = {row["media_id"]: row["id"] for row in db.execute("""SELECT r.id,r.media_id FROM ocr_runs r
@@ -1293,7 +1330,7 @@ def prepared_simple_export(project_id: str, payload: SimpleExportRequest):
                                ("source_transcript_meta", "media_id"), ("alignment_previews", "media_id"),
                                ("vad_jobs", "media_id"), ("vad_runs", "media_id"), ("all_vad_intervals", "media_id"),
                                ("ocr_jobs", "media_id"), ("ocr_runs", "media_id"),
-                               ("subtitle_state_operations", "media_id")):
+                               ("subtitle_state_operations", "media_id"), ("target_event_reviews", "media_id")):
                 actual_table = "vad_intervals" if table == "all_vad_intervals" else table
                 rows = db.execute(f"SELECT * FROM {actual_table} WHERE {key} IN ({','.join('?' for _ in media_ids)})", media_ids).fetchall() if media_ids else []
                 data[table] = [{key[:-5] if key.endswith("_json") else key:

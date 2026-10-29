@@ -159,6 +159,14 @@ CREATE TABLE IF NOT EXISTS subtitle_state_operations (
   result_ids_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'applied',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS target_event_reviews (
+  id TEXT PRIMARY KEY, media_id TEXT NOT NULL REFERENCES media_assets(id), run_id TEXT,
+  previous_state_id TEXT NOT NULL, current_state_id TEXT NOT NULL,
+  source_fingerprint TEXT NOT NULL, human_event_type TEXT, review_status TEXT NOT NULL,
+  notes TEXT NOT NULL DEFAULT '', snapshot_json TEXT NOT NULL DEFAULT '{}',
+  invalidated INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS derived_events (
   id TEXT PRIMARY KEY, media_id TEXT NOT NULL REFERENCES media_assets(id),
   start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
@@ -292,6 +300,7 @@ def initialize(db_path: Path) -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_ocr_states_media ON subtitle_screen_states(media_id,run_id,start_ms)")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ocr_observation_frame ON ocr_observations(run_id,frame_ms) WHERE run_id IS NOT NULL")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_ocr_chunks_job ON ocr_job_chunks(job_id,chunk_index)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_target_event_reviews_media ON target_event_reviews(media_id,run_id)")
         connection.execute("INSERT OR IGNORE INTO app_preferences (key, value_json) VALUES ('asr', '{\"auto_transcribe\":true,\"default_model\":\"small\"}')")
         connection.execute("UPDATE projects SET storage_rel_path = 'projects/' || id WHERE storage_rel_path = ''")
         connection.execute("UPDATE media_assets SET display_name = filename WHERE display_name = ''")

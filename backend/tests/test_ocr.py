@@ -206,10 +206,10 @@ def test_simple_export_uses_selected_run_and_explicit_review_filters(media):
     latest.include_unreviewed = True
     assert len(json.loads(main.download_simple_export(project_id, latest).body)) == 3
     metrics = main.SimpleExportRequest(media_id=media_id, datasets=["target_update_events", "output_gap_candidates"],
-                                       ocr_run_id=first_run, gap_threshold_ms=200)
+                                       ocr_run_id=first_run, gap_threshold_ms=200, include_unreviewed=True)
     archive = __import__("zipfile").ZipFile(__import__("io").BytesIO(main.download_simple_export(project_id, metrics).body))
     assert set(archive.namelist()) == {"target_update_events.json", "output_gap_candidates.json"}
-    assert len(json.loads(archive.read("target_update_events.json"))) == 2
+    assert len(json.loads(archive.read("target_update_events.json"))) == 4
     assert all("duration" in row for row in json.loads(archive.read("output_gap_candidates.json")))
     complete = json.loads(main.download_simple_export(project_id,
         main.SimpleExportRequest(complete_project=True)).body)

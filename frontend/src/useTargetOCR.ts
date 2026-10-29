@@ -12,7 +12,14 @@ type OCRJob = { id: string; status: 'queued' | 'running' | 'completed' | 'failed
 type OCRRun = { id: string; engine: string; engine_version: string; job_status: string; created_at: string; parameters: Record<string, unknown> }
 type OCRChunk = { chunk_index: number; status: string; core_start_ms: number; core_end_ms: number }
 type OCRSummary = { frames_sampled: number; ocr_calls: number; raw_text_variants: number; proposed_states: number; uncertain_transitions: number; duplicate_observations_consolidated: number }
-type OCRMetrics = { target_update_events: Array<{ id: string; start_ms: number; event_type: string; before_text: string; after_text: string }> }
+export type TargetEvent = { id: string; media_id: string; run_id: string | null; start_ms: number; end_ms: number
+  previous_state_id: string; current_state_id: string; before_text: string; after_text: string
+  visual_event_type: string; human_event_type: string | null; review_status: 'unreviewed' | 'confirmed' | 'rejected' | 'uncertain'
+  notes: string; invalidated: boolean; orphaned: boolean; source_fingerprint: string
+  time_precision: string
+  change_counts: { added: number; deleted: number; replaced: number }
+  diff: Array<{ kind: string; before: string; after: string }> }
+type EventDocument = { run_id: string | null; events: TargetEvent[] }
 type OCRDocument = { job: OCRJob | null; run: OCRRun | null; runs: OCRRun[]; chunks: OCRChunk[]; summary: OCRSummary | null; states: SubtitleState[] }
 const empty: OCRDocument = { job: null, run: null, runs: [], chunks: [], summary: null, states: [] }
 
@@ -23,24 +30,24 @@ async function json<T>(response: Response): Promise<T> {
 
 export function useTargetOCR(mediaId: string | null) {
   const [document, setDocument] = useState<OCRDocument>(empty)
-  const [metrics, setMetrics] = useState<OCRMetrics>({ target_update_events: [] })
+  const [events, setEvents] = useState<TargetEvent[]>([])
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const refresh = async () => {
     if (!mediaId) return
     const data = await json<OCRDocument>(await fetch(`/api/media/${mediaId}/target-ocr${selectedRunId ? `?run_id=${encodeURIComponent(selectedRunId)}` : ''}`))
     setDocument(data)
-    setMetrics(data.run ? await json<OCRMetrics>(await fetch(`/api/media/${mediaId}/target-ocr/metrics?run_id=${encodeURIComponent(data.run.id)}`)) : { target_update_events: [] })
+    setEvents(data.run ? (await json<EventDocument>(await fetch(`/api/media/${mediaId}/target-ocr/events?run_id=${encodeURIComponent(data.run.id)}`))).events : [])
     return data
   }
   useEffect(() => {
-    setDocument(empty); setMetrics({ target_update_events: [] }); setError('')
+    setDocument(empty); setEvents([]); setError('')
     if (!mediaId) return
     let active = true
     const update = async () => {
       try { const data = await json<OCRDocument>(await fetch(`/api/media/${mediaId}/target-ocr${selectedRunId ? `?run_id=${encodeURIComponent(selectedRunId)}` : ''}`)); if (active) setDocument(data)
-        const derived = data.run ? await json<OCRMetrics>(await fetch(`/api/media/${mediaId}/target-ocr/metrics?run_id=${encodeURIComponent(data.run.id)}`)) : { target_update_events: [] }
-        if (active) setMetrics(derived) }
+        const derived = data.run ? (await json<EventDocument>(await fetch(`/api/media/${mediaId}/target-ocr/events?run_id=${encodeURIComponent(data.run.id)}`))).events : []
+        if (active) setEvents(derived) }
       catch (reason) { if (active) setError(String(reason)) }
     }
     void update()
@@ -102,6 +109,15 @@ export function useTargetOCR(mediaId: string | null) {
     await refresh()
     return updated
   }
-  return { ...document, metrics, selectedRunId, selectRun: setSelectedRunId, error, refresh, start, cancel, resume,
-    saveState, insert, previewMerge, merge, split, group, toggleOperation }
+  const saveEvent = async (event: TargetEvent, change: Pick<TargetEvent, 'human_event_type' | 'review_status' | 'notes'>) => {
+    if (!mediaId) throw new Error('No media selected')
+    const updated = await json<TargetEvent>(await fetch(`/api/media/${mediaId}/target-ocr/events/${encodeURIComponent(event.id)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...change, run_id: event.run_id, source_fingerprint: event.source_fingerprint }),
+    }))
+    setEvents(current => current.map(item => item.id === event.id ? updated : item))
+    return updated
+  }
+  return { ...document, events, selectedRunId, selectRun: setSelectedRunId, error, refresh, start, cancel, resume,
+    saveState, saveEvent, insert, previewMerge, merge, split, group, toggleOperation }
 }
