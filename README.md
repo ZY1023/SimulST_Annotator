@@ -1,6 +1,6 @@
 # SimulST Annotator
 
-Local-first research workspace for simultaneous speech-to-text translation subtitles. The current release supports named projects, multiple MP4 files per project, local English source-speech transcription with word timestamps, separate manual annotation timelines, local autosave, and structured exports. The light workspace keeps its video player, synchronized waveform, inspector, and multi-tier timeline.
+Local-first research workspace for simultaneous speech-to-text translation subtitles. The current release supports named projects, MP4 import, source-speech transcription and VAD, selected-range or chunked full-video target OCR, reviewable subtitle screen states, descriptive timing events, manual annotation timelines, and structured exports. The light workspace keeps its synchronized video, waveform, inspector, and multi-tier timeline.
 
 ## Architecture
 
@@ -25,6 +25,9 @@ backend/                FastAPI
   app/exports.py         selected-tier and research-data export
   app/analysis_contracts.py  OCR and text-change data interfaces
   app/ocr.py             local PaddleOCR worker and subtitle-state assembly
+  app/subtitle_states.py reversible state merging, splitting and grouping
+  app/timing_metrics.py  descriptive subtitle update and output-gap intervals
+  app/simple_exports.py  selected dataset JSON/CSV and ZIP generation
   app/asr.py             stable-ts engine interface and SQLite-backed worker
   tests/                backend tests
 ../<repository-name>_data/ private SQLite database and media copies (outside Git)
