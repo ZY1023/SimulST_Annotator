@@ -125,7 +125,8 @@ def test_project_workflow_persistence_and_exports(tmp_path, monkeypatch):
     assert next(item for item in options["research_data"] if item["name"] == "source_transcripts")["record_count"] == 1
     assert {item["name"]: item["record_count"] for item in options["research_data"]} == {
         "source_transcripts": 1, "ocr_observations": 1,
-        "subtitle_screen_states": 1, "derived_events": 1, "vad_intervals": 0,
+            "subtitle_screen_states": 1, "derived_events": 1, "vad_intervals": 0,
+            "target_update_events": 0, "output_gap_candidates": 0,
     }
     one_tier = main.download_advanced_export(project.id, main.AdvancedExportRequest(
         media_id=first.id, tier_ids=[tier_a2.id], format="json", structure="separate"))
